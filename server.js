@@ -7,8 +7,17 @@ const { Pool } = require('pg');
 
 const app = express();
 const port = process.env.PORT || 5000;
+
+const isHostedDatabase =
+  process.env.DATABASE_URL?.includes("supabase.com") ||
+  process.env.DATABASE_URL?.includes("pooler.supabase.com") ||
+  process.env.DATABASE_URL?.includes("sslmode=require");
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: process.env.DATABASE_URL,
+  ssl: isHostedDatabase
+    ? { rejectUnauthorized: false }
+    : false
 });
 
 app.use(cors());
