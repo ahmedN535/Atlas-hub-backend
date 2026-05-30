@@ -1,0 +1,12 @@
+.env
+
+# PostgreSQL / Docker
+postgres_data/
+*.dump
+*.sql.gz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
