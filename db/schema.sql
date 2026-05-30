@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
   username VARCHAR(50) NOT NULL UNIQUE,
@@ -9,13 +11,33 @@ CREATE TABLE users (
 
 CREATE TABLE agents (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+
   name VARCHAR(100) NOT NULL,
   description TEXT NOT NULL,
-  category VARCHAR(50) NOT NULL,
+  manual TEXT,
+
+  category VARCHAR(50),
   model VARCHAR(100),
+
+  file_name TEXT,
+  file_content TEXT,
+
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE agent_embeddings (
+  agent_id INTEGER PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+
+  indexed_text TEXT NOT NULL,
+  embedding vector(1536),
+
+  embedding_model TEXT NOT NULL DEFAULT 'openai/text-embedding-3-small',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE reviews (
@@ -31,3 +53,8 @@ CREATE TABLE reviews (
 CREATE INDEX idx_agents_user_id ON agents(user_id);
 CREATE INDEX idx_agents_category ON agents(category);
 CREATE INDEX idx_reviews_agent_id ON reviews(agent_id);
+
+CREATE INDEX idx_agent_embeddings_vector
+ON agent_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);

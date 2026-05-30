@@ -3,9 +3,22 @@ const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const { Pool } = require('pg');
 
 const app = express();
 const port = process.env.PORT || 5000;
+
+const isHostedDatabase =
+  process.env.DATABASE_URL?.includes("supabase.com") ||
+  process.env.DATABASE_URL?.includes("pooler.supabase.com") ||
+  process.env.DATABASE_URL?.includes("sslmode=require");
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: isHostedDatabase
+    ? { rejectUnauthorized: false }
+    : false
+});
 
 app.use(cors());
 app.use(express.json());
@@ -13,8 +26,54 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: "Backend is alive and kicking!" });
+function toPgVector(vectorArray) {
+  if (!Array.isArray(vectorArray)) {
+    throw new Error("Embedding must be an array");
+  }
+  return `[${vectorArray.join(",")}]`;
+}
+
+async function generateEmbedding(apiKey, input) {
+  const embeddingResponse = await fetch("https://openrouter.ai/api/v1/embeddings", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey.trim()}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://localhost:5000"
+    },
+    body: JSON.stringify({
+      model: "openai/text-embedding-3-small",
+      input
+    })
+  });
+
+  const embeddingData = await embeddingResponse.json();
+
+  if (embeddingData && embeddingData.data && embeddingData.data[0]) {
+    return embeddingData.data[0].embedding;
+  }
+
+  console.error("[Embedding Diagnostic Log]:", embeddingData);
+  throw new Error("Failed validation on semantic vector assembly generation step.");
+}
+
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      status: "ok",
+      backend: "alive",
+      database: "connected"
+    });
+  } catch (error) {
+    console.error("[Database Health Check Failed]:", error);
+    res.status(500).json({
+      status: "error",
+      backend: "alive",
+      database: "disconnected",
+      details: error.message
+    });
+  }
 });
 
 app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
@@ -109,38 +168,76 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
       }
     }
 
-    // 4. GENERATE SEMANTIC EMBEDDING VECTOR
     console.log("[Embedding] Contacting text embedding services...");
     const textToEmbed = `Title: ${title}\nDescription: ${finalDescription}\nManual: ${finalManual}`;
+    const vectorArray = await generateEmbedding(apiKey, textToEmbed);
+    const pgVector = toPgVector(vectorArray);
 
-    // FIXED: Cleaned up the absolute URL string wrapper here
-    const embeddingResponse = await fetch("https://openrouter.ai/api/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey.trim()}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://localhost:5000"
-      },
-      body: JSON.stringify({
-        model: "openai/text-embedding-3-small",
-        input: textToEmbed
-      })
-    });
-    const embeddingData = await embeddingResponse.json();
-    let vectorArray = [];
+    const client = await pool.connect();
+    let savedAgent;
 
-    if (embeddingData && embeddingData.data && embeddingData.data[0]) {
-      vectorArray = embeddingData.data[0].embedding;
-    } else {
-      console.error("[Embedding Diagnostic Log]:", embeddingData);
-      throw new Error("Failed validation on semantic vector assembly generation step.");
+    try {
+      await client.query('BEGIN');
+
+      const agentResult = await client.query(
+        `INSERT INTO agents (
+          user_id,
+          name,
+          description,
+          manual,
+          category,
+          model,
+          file_name,
+          file_content,
+          is_public
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, name, description, manual`,
+        [
+          1,
+          title,
+          finalDescription,
+          finalManual,
+          req.body.category || "general",
+          req.body.model || "unknown",
+          req.file.originalname,
+          fileContent,
+          true
+        ]
+      );
+
+      savedAgent = agentResult.rows[0];
+
+      await client.query(
+        `INSERT INTO agent_embeddings (
+          agent_id,
+          indexed_text,
+          embedding,
+          embedding_model
+        )
+        VALUES ($1, $2, $3::vector, $4)`,
+        [
+          savedAgent.id,
+          textToEmbed,
+          pgVector,
+          "openai/text-embedding-3-small"
+        ]
+      );
+
+      await client.query('COMMIT');
+    } catch (dbError) {
+      await client.query('ROLLBACK');
+      throw dbError;
+    } finally {
+      client.release();
     }
     
-    console.log(`[Success] Processed agent "${title}" successfully!`);
+    console.log(`[Success] Processed and saved agent "${title}" successfully!`);
     
     return res.status(200).json({
-      message: "Agent processed successfully!",
+      message: "Agent processed and saved successfully!",
       data: {
+        id: savedAgent.id,
         title,
         description: finalDescription,
         manual: finalManual,
@@ -155,6 +252,141 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
   }
 });
 
-app.listen(port, () => {
+app.get('/api/agents', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        id,
+        name,
+        description,
+        category,
+        model,
+        file_name,
+        is_public,
+        created_at
+      FROM agents
+      WHERE is_public = TRUE
+      ORDER BY created_at DESC`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Agent List Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.get('/api/agents/:id', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        a.id,
+        a.name,
+        a.description,
+        a.manual,
+        a.category,
+        a.model,
+        a.file_name,
+        a.is_public,
+        a.created_at,
+        e.indexed_text,
+        e.embedding_model
+      FROM agents a
+      LEFT JOIN agent_embeddings e ON e.agent_id = a.id
+      WHERE a.id = $1 AND a.is_public = TRUE`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Agent not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Agent Detail Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.post('/api/agents/search', async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "Search query is required." });
+    }
+
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey || apiKey.includes("your_actual")) {
+      console.error("[CRITICAL] Your OPENROUTER_API_KEY inside the .env file is missing or default!");
+      return res.status(500).json({ error: "Backend configuration error: API key missing." });
+    }
+
+    const queryVectorArray = await generateEmbedding(apiKey, query);
+    const queryVector = toPgVector(queryVectorArray);
+
+    const result = await pool.query(
+      `SELECT
+        a.id,
+        a.name,
+        a.description,
+        a.category,
+        a.model,
+        a.file_name,
+        1 - (e.embedding <=> $1::vector) AS similarity
+      FROM agents a
+      JOIN agent_embeddings e ON e.agent_id = a.id
+      WHERE a.is_public = TRUE
+        AND e.embedding IS NOT NULL
+      ORDER BY e.embedding <=> $1::vector
+      LIMIT 10`,
+      [queryVector]
+    );
+
+    res.json({
+      query,
+      results: result.rows.map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        description: agent.description,
+        category: agent.category,
+        model: agent.model,
+        file_name: agent.file_name,
+        similarity: Number(agent.similarity),
+        reason: "Matched by semantic similarity to the search query."
+      }))
+    });
+  } catch (error) {
+    console.error("Agent Search Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+const server = app.listen(port, () => {
   console.log(`Server running smoothly on port ${port}`);
+  console.log(`Health check: http://localhost:${port}/api/health`);
+});
+
+server.on("error", (error) => {
+  console.error("[Server Error]", error);
+});
+
+server.on("close", () => {
+  console.log("[Server Closed] Express server closed unexpectedly.");
+});
+
+process.on("beforeExit", (code) => {
+  console.log("[Process beforeExit]", code);
+});
+
+process.on("exit", (code) => {
+  console.log("[Process exit]", code);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[Uncaught Exception]", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Unhandled Rejection]", reason);
 });
