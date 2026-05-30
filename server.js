@@ -85,13 +85,24 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
         }
 
         try {
-          const parsedAiResult = JSON.parse(rawJsonText);
-          finalDescription = userDescription || parsedAiResult.suggested_description;
-          finalManual = userManual || parsedAiResult.suggested_manual;
-        } catch (jsonParseErr) {
-          console.error("[JSON Error] Content payload failed evaluation parsing:", rawJsonText);
-          throw new Error("Formatting constraints fell out of standard parsable parameters.");
-        }
+            // Clean up any weird invisible spaces, line breaks, or markdown block hangers
+            let cleanJsonString = rawJsonText.trim();
+            
+            // Regex fallback: If Claude wrapped the JSON inside ```json ... ``` blocks anyway, extract just the object
+            if (cleanJsonString.includes("{")) {
+              const firstBracket = cleanJsonString.indexOf("{");
+              const lastBracket = cleanJsonString.lastIndexOf("}");
+              cleanJsonString = cleanJsonString.substring(firstBracket, lastBracket + 1);
+            }
+  
+            const parsedAiResult = JSON.parse(cleanJsonString);
+            
+            finalDescription = userDescription || parsedAiResult.suggested_description;
+            finalManual = userManual || parsedAiResult.suggested_manual;
+          } catch (jsonParseErr) {
+            console.error("[CRITICAL JSON CRASH] Claude string failed to parse. Raw output was:", rawJsonText);
+            throw new Error("Formatting constraints fell out of standard parsable parameters.");
+          }
       } else {
         console.error("[Diagnostic Log] Raw structural mismatch payload return:", aiData);
         throw new Error("Returned structured array state configuration error or drop.");
