@@ -1,3 +1,4 @@
+
 .env
 
 # PostgreSQL / Docker
@@ -10,3 +11,7 @@ postgres_data/
 Thumbs.db
 .vscode/
 .idea/
+
+node_modules/
+.env
+
