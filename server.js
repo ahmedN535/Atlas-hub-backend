@@ -333,12 +333,12 @@ app.post('/api/agents/search', async (req, res) => {
         a.category,
         a.model,
         a.file_name,
-        1 - (e.embedding <=> $1::vector) AS similarity
+        1 - (e.embedding <=> $1::vector(1536)) AS similarity
       FROM agents a
       JOIN agent_embeddings e ON e.agent_id = a.id
       WHERE a.is_public = TRUE
         AND e.embedding IS NOT NULL
-      ORDER BY e.embedding <=> $1::vector
+      ORDER BY e.embedding <=> $1::vector(1536)
       LIMIT 10`,
       [queryVector]
     );

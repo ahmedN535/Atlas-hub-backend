@@ -54,7 +54,9 @@ CREATE INDEX idx_agents_user_id ON agents(user_id);
 CREATE INDEX idx_agents_category ON agents(category);
 CREATE INDEX idx_reviews_agent_id ON reviews(agent_id);
 
-CREATE INDEX idx_agent_embeddings_vector
-ON agent_embeddings
-USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+-- IVFFlat is intentionally disabled for the hackathon MVP.
+-- With only a few agents, exact vector search is more reliable.
+-- CREATE INDEX idx_agent_embeddings_vector
+-- ON agent_embeddings
+-- USING ivfflat (embedding vector_cosine_ops)
+-- WITH (lists = 100);
