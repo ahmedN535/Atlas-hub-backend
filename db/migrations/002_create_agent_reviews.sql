@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS public.agent_reviews (
   id BIGSERIAL PRIMARY KEY,
 
   agent_id INTEGER NOT NULL REFERENCES public.agents(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
 
   rating_x2 SMALLINT NOT NULL,
 
@@ -38,6 +38,6 @@ DROP CONSTRAINT IF EXISTS agent_reviews_written_feedback_check;
 ALTER TABLE public.agent_reviews
 ADD CONSTRAINT agent_reviews_written_feedback_check
 CHECK (
-  length(trim(experience)) >= 10
-  AND length(trim(downsides)) >= 5
+  length(trim(experience)) > 0
+  AND length(trim(downsides)) > 0
 );

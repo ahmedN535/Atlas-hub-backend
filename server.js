@@ -1754,10 +1754,10 @@ app.get("/api/agents/:id/reviews", async (req, res) => {
         r.downsides,
         r.created_at,
         r.updated_at,
-        p.display_name AS author_name,
-        p.username AS author_username
+        u.display_name AS author_name,
+        u.username AS author_username
       FROM agent_reviews r
-      LEFT JOIN profiles p ON p.id = r.user_id
+      LEFT JOIN users u ON u.id = r.user_id
       WHERE r.agent_id = $1
       ORDER BY r.created_at DESC
       `,
@@ -1788,10 +1788,10 @@ app.get("/api/agents/:id/reviews", async (req, res) => {
   }
 });
 
-app.post("/api/agents/:id/reviews", requireAuth, async (req, res) => {
+app.post("/api/agents/:id/reviews", async (req, res) => {
   try {
     const agentId = Number(req.params.id);
-    const userId = req.authUser.id;
+    const userId = getCurrentUserId(req);
 
     if (!Number.isInteger(agentId)) {
       return res.status(400).json({ error: "Invalid agent id." });
@@ -1825,13 +1825,35 @@ app.post("/api/agents/:id/reviews", requireAuth, async (req, res) => {
 
     const agentCheck = await pool.query(
       `
-      SELECT id
-      FROM agents
-      WHERE id = $1
-        AND is_public = TRUE
-        AND deleted_at IS NULL
+      SELECT a.id
+      FROM agents a
+      WHERE a.id = $1
+        AND a.deleted_at IS NULL
+        AND (
+          a.visibility = 'public'
+          OR a.user_id = $2
+          OR (
+            a.visibility = 'followers'
+            AND EXISTS (
+              SELECT 1
+              FROM follows f
+              WHERE f.follower_id = $2
+                AND f.following_id = a.user_id
+            )
+          )
+          OR (
+            a.visibility = 'org_only'
+            AND a.org_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM organization_members om
+              WHERE om.org_id = a.org_id
+                AND om.user_id = $2::text
+            )
+          )
+        )
       `,
-      [agentId]
+      [agentId, userId]
     );
 
     if (agentCheck.rows.length === 0) {
@@ -1842,33 +1864,49 @@ app.post("/api/agents/:id/reviews", requireAuth, async (req, res) => {
 
     const result = await pool.query(
       `
-      INSERT INTO agent_reviews (
-        agent_id,
-        user_id,
-        rating_x2,
-        title,
-        experience,
-        downsides
+      WITH saved_review AS (
+        INSERT INTO agent_reviews (
+          agent_id,
+          user_id,
+          rating_x2,
+          title,
+          experience,
+          downsides
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (agent_id, user_id)
+        DO UPDATE SET
+          rating_x2 = EXCLUDED.rating_x2,
+          title = EXCLUDED.title,
+          experience = EXCLUDED.experience,
+          downsides = EXCLUDED.downsides,
+          updated_at = NOW()
+        RETURNING
+          id,
+          agent_id,
+          user_id,
+          rating_x2,
+          title,
+          experience,
+          downsides,
+          created_at,
+          updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (agent_id, user_id)
-      DO UPDATE SET
-        rating_x2 = EXCLUDED.rating_x2,
-        title = EXCLUDED.title,
-        experience = EXCLUDED.experience,
-        downsides = EXCLUDED.downsides,
-        updated_at = NOW()
-      RETURNING
-        id,
-        agent_id,
-        user_id,
-        rating_x2,
-        rating_x2 / 2.0 AS rating,
-        title,
-        experience,
-        downsides,
-        created_at,
-        updated_at
+      SELECT
+        sr.id,
+        sr.agent_id,
+        sr.user_id,
+        sr.rating_x2,
+        sr.rating_x2 / 2.0 AS rating,
+        sr.title,
+        sr.experience,
+        sr.downsides,
+        sr.created_at,
+        sr.updated_at,
+        u.display_name AS author_name,
+        u.username AS author_username
+      FROM saved_review sr
+      LEFT JOIN users u ON u.id = sr.user_id
       `,
       [agentId, userId, ratingX2, title, experience, downsides]
     );
