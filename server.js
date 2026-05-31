@@ -5,8 +5,18 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const { Pool } = require('pg');
 
+const { createClient } = require("@supabase/supabase-js");
+
 const app = express();
 const port = process.env.PORT || 5000;
+
+const supabaseAdmin =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+      )
+    : null;
 
 const isHostedDatabase =
   process.env.DATABASE_URL?.includes("supabase.com") ||
@@ -22,6 +32,77 @@ const pool = new Pool({
 
 app.use(cors());
 app.use(express.json());
+
+async function requireAuth(req, res, next) {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({
+        error: "Backend Supabase auth is not configured.",
+      });
+    }
+
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice("Bearer ".length)
+      : null;
+
+    if (!token) {
+      return res.status(401).json({ error: "Sign in required." });
+    }
+
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+
+    if (error || !data?.user) {
+      return res.status(401).json({ error: "Invalid or expired session." });
+    }
+
+    req.authUser = data.user;
+    await ensureProfile(data.user);
+    next();
+
+  } catch (error) {
+    console.error("[Auth Error]", error);
+    return res.status(500).json({ error: "Authentication failed." });
+  }
+}
+
+async function ensureProfile(user) {
+  const metadata = user.user_metadata || {};
+
+  const displayName =
+    metadata.display_name ||
+    metadata.full_name ||
+    user.email?.split("@")[0] ||
+    "Atlas user";
+
+  const emailPrefix =
+    user.email?.split("@")[0]?.replace(/[^a-zA-Z0-9_]/g, "_") || "user";
+
+  // Add part of the UUID to avoid username unique constraint conflicts.
+  const fallbackUsername = `${emailPrefix}_${user.id.slice(0, 8)}`.slice(0, 50);
+
+  const username =
+    metadata.username?.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 50) ||
+    fallbackUsername;
+
+  await pool.query(
+    `
+    INSERT INTO profiles (
+      id,
+      email,
+      username,
+      display_name
+    )
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (id) DO UPDATE SET
+      email = EXCLUDED.email,
+      display_name = COALESCE(NULLIF(profiles.display_name, ''), EXCLUDED.display_name),
+      username = COALESCE(profiles.username, EXCLUDED.username),
+      updated_at = NOW()
+    `,
+    [user.id, user.email, username, displayName]
+  );
+}
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
@@ -595,6 +676,179 @@ app.get('/api/agents/:id', async (req, res) => {
   }
 });
 
+function normalizeReviewResponse(row) {
+  return {
+    id: row.id,
+    agent_id: row.agent_id,
+    user_id: row.user_id,
+    rating: Number(row.rating),
+    title: row.title || "",
+    experience: row.experience || "",
+    downsides: row.downsides || "",
+
+    // These match your current frontend review shape too.
+    authorName: row.author_name || "Atlas Reviewer",
+    authorTeam: row.author_username || "Contributor",
+    body: row.experience || "",
+    constraints: row.downsides || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+app.get("/api/agents/:id/reviews", async (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+
+    if (!Number.isInteger(agentId)) {
+      return res.status(400).json({ error: "Invalid agent id." });
+    }
+
+    const reviewsResult = await pool.query(
+      `
+      SELECT
+        r.id,
+        r.agent_id,
+        r.user_id,
+        r.rating_x2,
+        r.rating_x2 / 2.0 AS rating,
+        r.title,
+        r.experience,
+        r.downsides,
+        r.created_at,
+        r.updated_at,
+        p.display_name AS author_name,
+        p.username AS author_username
+      FROM agent_reviews r
+      LEFT JOIN profiles p ON p.id = r.user_id
+      WHERE r.agent_id = $1
+      ORDER BY r.created_at DESC
+      `,
+      [agentId]
+    );
+
+    const summaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS review_count,
+        COALESCE(AVG(rating_x2) / 2.0, 0)::float AS average_rating
+      FROM agent_reviews
+      WHERE agent_id = $1
+      `,
+      [agentId]
+    );
+
+    res.json({
+      reviews: reviewsResult.rows.map(normalizeReviewResponse),
+      summary: summaryResult.rows[0],
+    });
+  } catch (error) {
+    console.error("[Get Reviews Error]", error);
+    res.status(500).json({
+      error: "Could not load reviews.",
+      details: error.message,
+    });
+  }
+});
+
+app.post("/api/agents/:id/reviews", requireAuth, async (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+    const userId = req.authUser.id;
+
+    if (!Number.isInteger(agentId)) {
+      return res.status(400).json({ error: "Invalid agent id." });
+    }
+
+    const rating = Number(req.body.rating);
+
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({
+        error: "Rating must be a whole number between 1 and 5.",
+      });
+    }
+
+    const title = String(req.body.title || "").trim();
+
+    // Supports both your current frontend names and the cleaner backend names.
+    const experience = String(req.body.experience || req.body.body || "").trim();
+    const downsides = String(req.body.downsides || req.body.constraints || "").trim();
+
+    if (!experience) {
+      return res.status(400).json({
+        error: "Experience description is required.",
+      });
+    }
+
+    if (!downsides) {
+      return res.status(400).json({
+        error: "Downsides or shortcomings are required.",
+      });
+    }
+
+    const agentCheck = await pool.query(
+      `
+      SELECT id
+      FROM agents
+      WHERE id = $1
+        AND is_public = TRUE
+        AND deleted_at IS NULL
+      `,
+      [agentId]
+    );
+
+    if (agentCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Agent not found." });
+    }
+
+    const ratingX2 = rating * 2;
+
+    const result = await pool.query(
+      `
+      INSERT INTO agent_reviews (
+        agent_id,
+        user_id,
+        rating_x2,
+        title,
+        experience,
+        downsides
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (agent_id, user_id)
+      DO UPDATE SET
+        rating_x2 = EXCLUDED.rating_x2,
+        title = EXCLUDED.title,
+        experience = EXCLUDED.experience,
+        downsides = EXCLUDED.downsides,
+        updated_at = NOW()
+      RETURNING
+        id,
+        agent_id,
+        user_id,
+        rating_x2,
+        rating_x2 / 2.0 AS rating,
+        title,
+        experience,
+        downsides,
+        created_at,
+        updated_at
+      `,
+      [agentId, userId, ratingX2, title, experience, downsides]
+    );
+
+    res.status(201).json({
+      message: "Review saved.",
+      review: normalizeReviewResponse(result.rows[0]),
+    });
+  } catch (error) {
+    console.error("[Save Review Error]", error);
+    res.status(500).json({
+      error: "Could not save review.",
+      details: error.message,
+    });
+  }
+});
+
 app.post('/api/agents/search', async (req, res) => {
   try {
     const { query } = req.body;
@@ -613,20 +867,41 @@ app.post('/api/agents/search', async (req, res) => {
     const queryVector = toPgVector(queryVectorArray);
 
     const result = await pool.query(
-      `SELECT
-        a.id,
-        a.name,
-        a.description,
-        a.category,
-        a.model,
-        a.file_name,
-        a.tags,
-        1 - (e.embedding <=> $1::vector(1536)) AS similarity
-      FROM agents a
-      JOIN agent_embeddings e ON e.agent_id = a.id
-      WHERE a.is_public = TRUE
-        AND e.embedding IS NOT NULL
-      ORDER BY e.embedding <=> $1::vector(1536)
+      `WITH review_stats AS (
+        SELECT
+          agent_id,
+          COUNT(*)::int AS review_count,
+          COALESCE(AVG(rating_x2) / 2.0, 0)::float AS average_rating
+        FROM agent_reviews
+        GROUP BY agent_id
+      ),
+      semantic_results AS (
+        SELECT
+          a.id,
+          a.name,
+          a.description,
+          a.category,
+          a.model,
+          a.file_name,
+          a.tags,
+          1 - (e.embedding <=> $1::vector(1536)) AS similarity,
+          COALESCE(rs.review_count, 0) AS review_count,
+          COALESCE(rs.average_rating, 0) AS average_rating
+        FROM agents a
+        JOIN agent_embeddings e ON e.agent_id = a.id
+        LEFT JOIN review_stats rs ON rs.agent_id = a.id
+        WHERE a.is_public = TRUE
+          AND e.embedding IS NOT NULL
+          AND a.deleted_at IS NULL
+      )
+      SELECT *,
+        (
+          similarity * 0.80
+          + (average_rating / 5.0) * 0.15
+          + LEAST(review_count, 20) / 20.0 * 0.05
+        ) AS ranking_score
+      FROM semantic_results
+      ORDER BY ranking_score DESC
       LIMIT 10`,
       [queryVector]
     );
@@ -642,7 +917,10 @@ app.post('/api/agents/search', async (req, res) => {
         file_name: agent.file_name,
         tags: agent.tags || [],
         similarity: Number(agent.similarity),
-        reason: "Matched by semantic similarity to the search query."
+        average_rating: Number(agent.average_rating),
+        review_count: Number(agent.review_count),
+        ranking_score: Number(agent.ranking_score),
+        reason: "Matched by semantic similarity, with review trust signals included."
       }))
     });
   } catch (error) {
