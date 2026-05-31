@@ -155,7 +155,8 @@ function normalizeVisibility(body) {
   const rawVisibility = body.visibility || body.agentVisibility;
 
   if (rawVisibility === "private") return "private";
-  if (rawVisibility === "followers") return "followers";
+  if (rawVisibility === "followers" || rawVisibility === "followers_only") return "followers";
+  if (rawVisibility === "org_only") return "org_only";
   if (rawVisibility === "public") return "public";
 
   if (body.isPublic === false || body.isPublic === "false" || body.is_public === false || body.is_public === "false") {
@@ -170,9 +171,167 @@ function isPublicFromVisibility(visibility) {
 }
 
 function assertValidVisibility(visibility) {
-  if (!["public", "private", "followers"].includes(visibility)) {
-    throw new Error("Invalid visibility. Use public, private, or followers.");
+  if (!["public", "private", "followers", "org_only"].includes(visibility)) {
+    throw new Error("Invalid visibility. Use public, private, followers, or org_only.");
   }
+}
+
+function parseNullableId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
+}
+
+function normalizeRole(value, fallback = "member") {
+  const role = String(value || "").trim().toLowerCase();
+  return ["owner", "admin", "member"].includes(role) ? role : fallback;
+}
+
+function slugify(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+async function getOrganizationRole(client, orgId, userId) {
+  const result = await client.query(
+    `SELECT role
+     FROM organization_members
+     WHERE org_id = $1 AND user_id = $2`,
+    [orgId, String(userId)]
+  );
+
+  return result.rows[0]?.role || null;
+}
+
+async function requireOrganizationRole(client, orgId, userId, allowedRoles) {
+  const role = await getOrganizationRole(client, orgId, userId);
+
+  if (!role || !allowedRoles.includes(role)) {
+    const error = new Error("You do not have permission to manage this organization.");
+    error.status = 403;
+    throw error;
+  }
+
+  return role;
+}
+
+async function getOrganizationMembers(client, orgId) {
+  const result = await client.query(
+    `SELECT
+      om.org_id,
+      om.user_id,
+      om.role,
+      om.joined_at,
+      u.username,
+      u.display_name,
+      u.email
+    FROM organization_members om
+    LEFT JOIN users u ON u.id::text = om.user_id
+    WHERE om.org_id = $1
+    ORDER BY
+      CASE om.role
+        WHEN 'owner' THEN 1
+        WHEN 'admin' THEN 2
+        ELSE 3
+      END,
+      om.joined_at ASC`,
+    [orgId]
+  );
+
+  return result.rows.map((member) => ({
+    ...member,
+    display_name: member.display_name || member.username || `User ${member.user_id}`
+  }));
+}
+
+async function getOrganizationAgents(client, orgId) {
+  const result = await client.query(
+    `SELECT
+      a.id,
+      a.name,
+      a.description,
+      a.category,
+      a.model,
+      a.file_name,
+      a.is_public,
+      a.visibility,
+      a.org_id,
+      a.user_id,
+      a.user_id AS uploader_id,
+      u.username AS owner_username,
+      u.display_name AS uploader_name,
+      u.display_name AS team,
+      a.tags,
+      a.created_at
+    FROM agents a
+    LEFT JOIN users u ON u.id = a.user_id
+    WHERE a.org_id = $1
+      AND a.deleted_at IS NULL
+    ORDER BY a.created_at DESC`,
+    [orgId]
+  );
+
+  return result.rows;
+}
+
+async function getOrganizationDetail(client, orgId, userId) {
+  const userKey = String(userId);
+  const result = await client.query(
+    `SELECT
+      o.id,
+      o.name,
+      o.slug,
+      o.description,
+      o.avatar_url,
+      o.created_by,
+      o.created_at,
+      o.updated_at,
+      om.role AS current_user_role,
+      (
+        SELECT COUNT(*)::int
+        FROM organization_members members
+        WHERE members.org_id = o.id
+      ) AS member_count,
+      (
+        SELECT COUNT(*)::int
+        FROM agents a
+        WHERE a.org_id = o.id
+          AND a.deleted_at IS NULL
+      ) AS agent_count
+    FROM organizations o
+    LEFT JOIN organization_members om
+      ON om.org_id = o.id
+      AND om.user_id = $2
+    WHERE o.id = $1`,
+    [orgId, userKey]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  const organization = result.rows[0];
+  const [members, agents] = await Promise.all([
+    getOrganizationMembers(client, orgId),
+    getOrganizationAgents(client, orgId)
+  ]);
+
+  return {
+    ...organization,
+    members,
+    agents
+  };
+}
+
+function sendRouteError(res, error, fallbackMessage = "Internal Server Error") {
+  const status = error.status || 500;
+  if (status >= 500) console.error("[Route Error]", error);
+  res.status(status).json({ error: error.message || fallbackMessage, details: error.details });
 }
 
 function parseTags(value) {
@@ -648,6 +807,7 @@ app.get('/api/feed/following', async (req, res) => {
         a.file_name,
         a.is_public,
         a.visibility,
+        a.org_id,
         a.user_id,
         u.username AS owner_username,
         a.created_at,
@@ -657,7 +817,18 @@ app.get('/api/feed/following', async (req, res) => {
       LEFT JOIN users u ON u.id = a.user_id
       WHERE f.follower_id = $1
         AND a.deleted_at IS NULL
-        AND a.visibility IN ('public', 'followers')
+        AND (
+          a.visibility IN ('public', 'followers')
+          OR (
+            a.visibility = 'org_only'
+            AND EXISTS (
+              SELECT 1
+              FROM organization_members om
+              WHERE om.org_id = a.org_id
+                AND om.user_id = $1::text
+            )
+          )
+        )
       ORDER BY a.created_at DESC`,
       [currentUserId]
     );
@@ -705,6 +876,8 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
     const visibility = normalizeVisibility(req.body);
     assertValidVisibility(visibility);
     const isPublic = isPublicFromVisibility(visibility);
+    const requestedOrgId = parseNullableId(req.body.org_id ?? req.body.orgId);
+    const orgId = visibility === "org_only" ? requestedOrgId : null;
 
     const apiKey = getOpenRouterApiKey();
 
@@ -727,6 +900,16 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
     try {
       await client.query('BEGIN');
 
+      if (visibility === "org_only") {
+        if (!orgId) {
+          const error = new Error("Choose an organization before publishing an org-only agent.");
+          error.status = 400;
+          throw error;
+        }
+
+        await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+      }
+
       const agentResult = await client.query(
         `INSERT INTO agents (
           user_id,
@@ -739,6 +922,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           file_content,
           is_public,
           visibility,
+          org_id,
           tools_integrations,
           prerequisites,
           input_format,
@@ -752,7 +936,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           expected_users,
           tags
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         RETURNING
           id,
           name,
@@ -765,6 +949,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           is_public,
           is_public AS "isPublic",
           visibility,
+          org_id,
           tools_integrations AS "toolsIntegrations",
           prerequisites,
           input_format AS "inputFormat",
@@ -789,6 +974,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           fileContent,
           isPublic,
           visibility,
+          orgId,
           metadata.toolsIntegrations,
           metadata.prerequisites,
           metadata.inputFormat,
@@ -842,6 +1028,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
         visibility: savedAgent.visibility,
         isPublic: savedAgent.isPublic,
         is_public: savedAgent.is_public,
+        org_id: savedAgent.org_id,
         description: savedAgent.description,
         manual: savedAgent.manual,
         vectorLength: vectorArray.length
@@ -849,7 +1036,11 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
     });
   } catch (error) {
     console.error("Agent Upload Exception Stack:", error);
-    return res.status(500).json({ error: "Agent upload failed", details: error.message });
+    const status = error.status || 500;
+    return res.status(status).json({
+      error: status === 500 ? "Agent upload failed" : error.message,
+      details: error.message
+    });
   }
 });
 
@@ -867,6 +1058,7 @@ app.get('/api/agents', async (req, res) => {
         a.file_name,
         a.is_public,
         a.visibility,
+        a.org_id,
         a.user_id,
         u.username AS owner_username,
         a.created_at,
@@ -884,6 +1076,15 @@ app.get('/api/agents', async (req, res) => {
               FROM follows f
               WHERE f.follower_id = $1
                 AND f.following_id = a.user_id
+            )
+          )
+          OR (
+            a.visibility = 'org_only'
+            AND EXISTS (
+              SELECT 1
+              FROM organization_members om
+              WHERE om.org_id = a.org_id
+                AND om.user_id = $1::text
             )
           )
         )
@@ -912,6 +1113,7 @@ app.get('/api/me/agents', async (req, res) => {
         file_name,
         is_public,
         visibility,
+        org_id,
         created_at,
         updated_at,
         tags
@@ -929,6 +1131,403 @@ app.get('/api/me/agents', async (req, res) => {
   }
 });
 
+app.get('/api/organizations', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const currentUserKey = String(currentUserId);
+
+    const result = await pool.query(
+      `SELECT
+        o.id,
+        o.name,
+        o.slug,
+        o.description,
+        o.avatar_url,
+        o.created_by,
+        o.created_at,
+        o.updated_at,
+        om.role AS current_user_role,
+        COUNT(DISTINCT members.user_id)::int AS member_count,
+        COUNT(DISTINCT a.id)::int AS agent_count
+      FROM organization_members om
+      JOIN organizations o ON o.id = om.org_id
+      LEFT JOIN organization_members members ON members.org_id = o.id
+      LEFT JOIN agents a
+        ON a.org_id = o.id
+        AND a.deleted_at IS NULL
+      WHERE om.user_id = $1
+      GROUP BY
+        o.id,
+        o.name,
+        o.slug,
+        o.description,
+        o.avatar_url,
+        o.created_by,
+        o.created_at,
+        o.updated_at,
+        om.role
+      ORDER BY o.updated_at DESC, o.created_at DESC`,
+      [currentUserKey]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    sendRouteError(res, error);
+  }
+});
+
+app.post('/api/organizations', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const currentUserKey = String(currentUserId);
+    const name = String(req.body.name || "").trim();
+    const description = String(req.body.description || "").trim();
+    const avatarUrl = String(req.body.avatar_url || req.body.avatarUrl || "").trim();
+    const slug = slugify(req.body.slug || name);
+
+    if (!name) {
+      return res.status(400).json({ error: "Organization name is required." });
+    }
+
+    if (!slug) {
+      return res.status(400).json({ error: "Organization slug could not be generated." });
+    }
+
+    await client.query('BEGIN');
+
+    const orgResult = await client.query(
+      `INSERT INTO organizations (
+        name,
+        slug,
+        description,
+        avatar_url,
+        created_by
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING
+        id,
+        name,
+        slug,
+        description,
+        avatar_url,
+        created_by,
+        created_at,
+        updated_at`,
+      [name, slug, description, avatarUrl, currentUserKey]
+    );
+
+    const org = orgResult.rows[0];
+
+    await client.query(
+      `INSERT INTO organization_members (org_id, user_id, role)
+      VALUES ($1, $2, 'owner')
+      ON CONFLICT (org_id, user_id) DO UPDATE SET role = 'owner'`,
+      [org.id, currentUserKey]
+    );
+
+    const detail = await getOrganizationDetail(client, org.id, currentUserKey);
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      ...org,
+      ...detail,
+      current_user_role: "owner"
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+
+    if (error.code === "23505") {
+      error.status = 409;
+      error.message = "An organization with that slug already exists.";
+    }
+
+    sendRouteError(res, error, "Could not create organization.");
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/organizations/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const orgId = parseNullableId(req.params.id);
+
+    if (!orgId) {
+      return res.status(400).json({ error: "Organization id must be a positive integer." });
+    }
+
+    await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin", "member"]);
+
+    const organization = await getOrganizationDetail(client, orgId, currentUserId);
+
+    if (!organization) {
+      return res.status(404).json({ error: "Organization not found." });
+    }
+
+    res.json(organization);
+  } catch (error) {
+    sendRouteError(res, error);
+  } finally {
+    client.release();
+  }
+});
+
+app.patch('/api/organizations/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const orgId = parseNullableId(req.params.id);
+
+    if (!orgId) {
+      return res.status(400).json({ error: "Organization id must be a positive integer." });
+    }
+
+    await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+
+    const name = req.body.name === undefined ? null : String(req.body.name || "").trim();
+    const description =
+      req.body.description === undefined ? null : String(req.body.description || "").trim();
+    const avatarUrl =
+      req.body.avatar_url === undefined && req.body.avatarUrl === undefined
+        ? null
+        : String(req.body.avatar_url || req.body.avatarUrl || "").trim();
+    const slug =
+      req.body.slug === undefined
+        ? null
+        : slugify(req.body.slug);
+
+    if (name !== null && !name) {
+      return res.status(400).json({ error: "Organization name cannot be empty." });
+    }
+
+    if (req.body.slug !== undefined && !slug) {
+      return res.status(400).json({ error: "Organization slug cannot be empty." });
+    }
+
+    await client.query(
+      `UPDATE organizations
+      SET
+        name = COALESCE($2, name),
+        slug = COALESCE($3, slug),
+        description = COALESCE($4, description),
+        avatar_url = COALESCE($5, avatar_url),
+        updated_at = NOW()
+      WHERE id = $1`,
+      [orgId, name, slug, description, avatarUrl]
+    );
+
+    const organization = await getOrganizationDetail(client, orgId, currentUserId);
+
+    res.json(organization);
+  } catch (error) {
+    if (error.code === "23505") {
+      error.status = 409;
+      error.message = "An organization with that slug already exists.";
+    }
+
+    sendRouteError(res, error, "Could not update organization.");
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/organizations/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const orgId = parseNullableId(req.params.id);
+
+    if (!orgId) {
+      return res.status(400).json({ error: "Organization id must be a positive integer." });
+    }
+
+    await requireOrganizationRole(client, orgId, currentUserId, ["owner"]);
+
+    await client.query(`DELETE FROM organizations WHERE id = $1`, [orgId]);
+
+    res.json({ message: "Organization deleted successfully." });
+  } catch (error) {
+    sendRouteError(res, error, "Could not delete organization.");
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/organizations/:id/members', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const orgId = parseNullableId(req.params.id);
+    const userKey = String(req.body.user_id ?? req.body.userId ?? "").trim();
+    const role = normalizeRole(req.body.role);
+
+    if (!orgId) {
+      return res.status(400).json({ error: "Organization id must be a positive integer." });
+    }
+
+    if (!userKey) {
+      return res.status(400).json({ error: "Member user id is required." });
+    }
+
+    const actorRole = await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+
+    if (role === "owner" && actorRole !== "owner") {
+      return res.status(403).json({ error: "Only owners can add another owner." });
+    }
+
+    const result = await client.query(
+      `INSERT INTO organization_members (org_id, user_id, role)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role
+      RETURNING org_id, user_id, role, joined_at`,
+      [orgId, userKey, role]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    sendRouteError(res, error, "Could not add organization member.");
+  } finally {
+    client.release();
+  }
+});
+
+app.patch('/api/organizations/:id/members/:userId', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const orgId = parseNullableId(req.params.id);
+    const targetUserKey = String(req.params.userId || "").trim();
+    const nextRole = normalizeRole(req.body.role);
+
+    if (!orgId || !targetUserKey) {
+      return res.status(400).json({ error: "Organization id and member user id are required." });
+    }
+
+    const actorRole = await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+
+    if (nextRole === "owner" && actorRole !== "owner") {
+      return res.status(403).json({ error: "Only owners can promote another owner." });
+    }
+
+    const existing = await client.query(
+      `SELECT role
+      FROM organization_members
+      WHERE org_id = $1 AND user_id = $2`,
+      [orgId, targetUserKey]
+    );
+
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "Organization member not found." });
+    }
+
+    if (existing.rows[0].role === "owner" && actorRole !== "owner") {
+      return res.status(403).json({ error: "Only owners can change an owner role." });
+    }
+
+    if (existing.rows[0].role === "owner" && nextRole !== "owner") {
+      const ownerCount = await client.query(
+        `SELECT COUNT(*)::int AS count
+        FROM organization_members
+        WHERE org_id = $1 AND role = 'owner'`,
+        [orgId]
+      );
+
+      if (ownerCount.rows[0].count <= 1) {
+        return res.status(400).json({ error: "An organization must keep at least one owner." });
+      }
+    }
+
+    const result = await client.query(
+      `UPDATE organization_members
+      SET role = $3
+      WHERE org_id = $1 AND user_id = $2
+      RETURNING org_id, user_id, role, joined_at`,
+      [orgId, targetUserKey, nextRole]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    sendRouteError(res, error, "Could not update organization member.");
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/organizations/:id/members/:userId', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const currentUserKey = String(currentUserId);
+    const orgId = parseNullableId(req.params.id);
+    const targetUserKey = String(req.params.userId || "").trim();
+
+    if (!orgId || !targetUserKey) {
+      return res.status(400).json({ error: "Organization id and member user id are required." });
+    }
+
+    const isSelf = targetUserKey === currentUserKey;
+    const actorRole = await getOrganizationRole(client, orgId, currentUserId);
+
+    if (!actorRole) {
+      return res.status(403).json({ error: "You are not a member of this organization." });
+    }
+
+    if (!isSelf && !["owner", "admin"].includes(actorRole)) {
+      return res.status(403).json({ error: "You do not have permission to remove this member." });
+    }
+
+    const target = await client.query(
+      `SELECT role
+      FROM organization_members
+      WHERE org_id = $1 AND user_id = $2`,
+      [orgId, targetUserKey]
+    );
+
+    if (target.rows.length === 0) {
+      return res.status(404).json({ error: "Organization member not found." });
+    }
+
+    if (target.rows[0].role === "owner") {
+      if (actorRole !== "owner") {
+        return res.status(403).json({ error: "Only owners can remove an owner." });
+      }
+
+      const ownerCount = await client.query(
+        `SELECT COUNT(*)::int AS count
+        FROM organization_members
+        WHERE org_id = $1 AND role = 'owner'`,
+        [orgId]
+      );
+
+      if (ownerCount.rows[0].count <= 1) {
+        return res.status(400).json({ error: "An organization must keep at least one owner." });
+      }
+    }
+
+    await client.query(
+      `DELETE FROM organization_members
+      WHERE org_id = $1 AND user_id = $2`,
+      [orgId, targetUserKey]
+    );
+
+    res.json({ message: "Organization member removed successfully." });
+  } catch (error) {
+    sendRouteError(res, error, "Could not remove organization member.");
+  } finally {
+    client.release();
+  }
+});
+
 app.patch('/api/agents/:id/visibility', async (req, res) => {
   try {
     const currentUserId = getCurrentUserId(req);
@@ -941,25 +1540,44 @@ app.patch('/api/agents/:id/visibility', async (req, res) => {
     const visibility = normalizeVisibility(req.body);
     assertValidVisibility(visibility);
     const isPublic = isPublicFromVisibility(visibility);
+    const requestedOrgId = parseNullableId(req.body.org_id ?? req.body.orgId);
+    const orgId = visibility === "org_only" ? requestedOrgId : null;
 
-    const result = await pool.query(
-      `UPDATE agents
-      SET
-        visibility = $3,
-        is_public = $4,
-        updated_at = NOW()
-      WHERE id = $1
-        AND user_id = $2
-        AND deleted_at IS NULL
-      RETURNING
-        id,
-        name,
-        user_id,
-        visibility,
-        is_public,
-        updated_at`,
-      [agentId, currentUserId, visibility, isPublic]
-    );
+    if (visibility === "org_only" && !orgId) {
+      return res.status(400).json({ error: "Choose an organization before using org-only visibility." });
+    }
+
+    const client = await pool.connect();
+    let result;
+
+    try {
+      if (visibility === "org_only") {
+        await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+      }
+
+      result = await client.query(
+        `UPDATE agents
+        SET
+          visibility = $3,
+          is_public = $4,
+          org_id = $5,
+          updated_at = NOW()
+        WHERE id = $1
+          AND user_id = $2
+          AND deleted_at IS NULL
+        RETURNING
+          id,
+          name,
+          user_id,
+          visibility,
+          is_public,
+          org_id,
+          updated_at`,
+        [agentId, currentUserId, visibility, isPublic, orgId]
+      );
+    } finally {
+      client.release();
+    }
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Agent not found or you do not have permission to update it" });
@@ -968,7 +1586,8 @@ app.patch('/api/agents/:id/visibility', async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Agent Visibility Update Exception Stack:", error);
-    res.status(500).json({ error: "Internal Server Error", details: error.message });
+    const status = error.status || 500;
+    res.status(status).json({ error: status === 500 ? "Internal Server Error" : error.message, details: error.message });
   }
 });
 
@@ -1034,6 +1653,7 @@ app.get('/api/agents/:id', async (req, res) => {
         a.file_name,
         a.is_public,
         a.visibility,
+        a.org_id,
         u.username AS owner_username,
         a.tools_integrations AS "toolsIntegrations",
         a.prerequisites,
@@ -1067,6 +1687,15 @@ app.get('/api/agents/:id', async (req, res) => {
               FROM follows f
               WHERE f.follower_id = $2
                 AND f.following_id = a.user_id
+            )
+          )
+          OR (
+            a.visibility = 'org_only'
+            AND EXISTS (
+              SELECT 1
+              FROM organization_members om
+              WHERE om.org_id = a.org_id
+                AND om.user_id = $2::text
             )
           )
         )`,
@@ -1294,6 +1923,7 @@ app.post('/api/agents/search', async (req, res) => {
           a.model,
           a.file_name,
           a.visibility,
+          a.org_id,
           a.is_public,
           a.user_id,
           u.username AS owner_username,
@@ -1317,6 +1947,15 @@ app.post('/api/agents/search', async (req, res) => {
                 FROM follows f
                 WHERE f.follower_id = $2
                   AND f.following_id = a.user_id
+              )
+            )
+            OR (
+              a.visibility = 'org_only'
+              AND EXISTS (
+                SELECT 1
+                FROM organization_members om
+                WHERE om.org_id = a.org_id
+                  AND om.user_id = $2::text
               )
             )
           )
@@ -1344,6 +1983,7 @@ app.post('/api/agents/search', async (req, res) => {
         model: agent.model,
         file_name: agent.file_name,
         visibility: agent.visibility,
+        org_id: agent.org_id,
         is_public: agent.is_public,
         user_id: agent.user_id,
         owner_username: agent.owner_username,

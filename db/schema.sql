@@ -17,6 +17,25 @@ CREATE TABLE follows (
   CHECK (follower_id <> following_id)
 );
 
+CREATE TABLE organizations (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  description TEXT DEFAULT '',
+  avatar_url TEXT DEFAULT '',
+  created_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE organization_members (
+  org_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+  joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (org_id, user_id)
+);
+
 CREATE TABLE agents (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -46,12 +65,13 @@ CREATE TABLE agents (
 
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
   visibility TEXT NOT NULL DEFAULT 'public',
+  org_id BIGINT REFERENCES organizations(id) ON DELETE SET NULL,
   deleted_at TIMESTAMPTZ,
 
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-  CONSTRAINT agents_visibility_check CHECK (visibility IN ('public', 'private', 'followers'))
+  CONSTRAINT agents_visibility_check CHECK (visibility IN ('public', 'private', 'followers', 'org_only'))
 );
 
 CREATE TABLE agent_embeddings (
@@ -82,6 +102,9 @@ CREATE INDEX idx_agents_deleted_at ON agents(deleted_at);
 CREATE INDEX idx_agents_user_visibility ON agents(user_id, visibility);
 CREATE INDEX idx_follows_follower_id ON follows(follower_id);
 CREATE INDEX idx_follows_following_id ON follows(following_id);
+CREATE INDEX idx_org_members_user ON organization_members(user_id);
+CREATE INDEX idx_org_members_org ON organization_members(org_id);
+CREATE INDEX idx_agents_org ON agents(org_id);
 CREATE INDEX idx_reviews_agent_id ON reviews(agent_id);
 
 -- IVFFlat is intentionally disabled for the hackathon MVP.
