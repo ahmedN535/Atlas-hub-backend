@@ -9,6 +9,14 @@ CREATE TABLE users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE follows (
+  follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  following_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (follower_id, following_id),
+  CHECK (follower_id <> following_id)
+);
+
 CREATE TABLE agents (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -37,9 +45,13 @@ CREATE TABLE agents (
   file_content TEXT,
 
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
+  visibility TEXT NOT NULL DEFAULT 'public',
+  deleted_at TIMESTAMPTZ,
 
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT agents_visibility_check CHECK (visibility IN ('public', 'private', 'followers'))
 );
 
 CREATE TABLE agent_embeddings (
@@ -65,6 +77,11 @@ CREATE TABLE reviews (
 
 CREATE INDEX idx_agents_user_id ON agents(user_id);
 CREATE INDEX idx_agents_category ON agents(category);
+CREATE INDEX idx_agents_visibility ON agents(visibility);
+CREATE INDEX idx_agents_deleted_at ON agents(deleted_at);
+CREATE INDEX idx_agents_user_visibility ON agents(user_id, visibility);
+CREATE INDEX idx_follows_follower_id ON follows(follower_id);
+CREATE INDEX idx_follows_following_id ON follows(following_id);
 CREATE INDEX idx_reviews_agent_id ON reviews(agent_id);
 
 -- IVFFlat is intentionally disabled for the hackathon MVP.
