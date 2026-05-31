@@ -20,6 +20,19 @@ CREATE TABLE agents (
   category VARCHAR(50),
   model VARCHAR(100),
 
+  tools_integrations TEXT DEFAULT '',
+  prerequisites TEXT DEFAULT '',
+  input_format TEXT DEFAULT '',
+  output_format TEXT DEFAULT '',
+  use_cases TEXT DEFAULT '',
+  example_prompts TEXT DEFAULT '',
+  limitations TEXT DEFAULT '',
+  when_to_use TEXT DEFAULT '',
+  when_not_to_use TEXT DEFAULT '',
+  setup_instructions TEXT DEFAULT '',
+  expected_users TEXT DEFAULT '',
+  tags TEXT[] DEFAULT '{}',
+
   file_name TEXT,
   file_content TEXT,
 

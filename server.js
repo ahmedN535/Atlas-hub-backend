@@ -33,6 +33,273 @@ function toPgVector(vectorArray) {
   return `[${vectorArray.join(",")}]`;
 }
 
+function parseBoolean(value, defaultValue) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (["true", "1", "yes", "y", "on", "public"].includes(normalized)) {
+    return true;
+  }
+
+  if (["false", "0", "no", "n", "off", "private"].includes(normalized)) {
+    return false;
+  }
+
+  return defaultValue;
+}
+
+function parseTags(value) {
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+
+  let rawTags = value;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      rawTags = Array.isArray(parsed) ? parsed : trimmed;
+    } catch (_error) {
+      rawTags = trimmed;
+    }
+  }
+
+  const tagList = Array.isArray(rawTags)
+    ? rawTags
+    : String(rawTags).split(/[,;\n]/);
+
+  const seen = new Set();
+  const tags = [];
+
+  for (const tag of tagList) {
+    const normalizedTag = String(tag || "").trim();
+    const dedupeKey = normalizedTag.toLowerCase();
+
+    if (normalizedTag && !seen.has(dedupeKey)) {
+      seen.add(dedupeKey);
+      tags.push(normalizedTag);
+    }
+  }
+
+  return tags;
+}
+
+function pickText(body, camelName, snakeName, defaultValue = "") {
+  const value = body[camelName] ?? body[snakeName];
+
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n");
+  }
+
+  return String(value).trim();
+}
+
+function buildIndexedText(agentMetadata) {
+  const sections = [
+    ["Title", agentMetadata.title],
+    ["Category", agentMetadata.category],
+    ["Model", agentMetadata.model],
+    ["Description", agentMetadata.description],
+    ["Manual", agentMetadata.manual],
+    ["Tools and integrations", agentMetadata.toolsIntegrations],
+    ["Prerequisites", agentMetadata.prerequisites],
+    ["Input format", agentMetadata.inputFormat],
+    ["Output format", agentMetadata.outputFormat],
+    ["Use cases", agentMetadata.useCases],
+    ["Example prompts", agentMetadata.examplePrompts],
+    ["Limitations", agentMetadata.limitations],
+    ["When to use", agentMetadata.whenToUse],
+    ["When not to use", agentMetadata.whenNotToUse],
+    ["Setup instructions", agentMetadata.setupInstructions],
+    ["Expected users", agentMetadata.expectedUsers],
+    ["Tags", Array.isArray(agentMetadata.tags) ? agentMetadata.tags.join(", ") : agentMetadata.tags],
+    ["File content summary", agentMetadata.fileContentSummary]
+  ];
+
+  return sections
+    .filter(([_label, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+    .map(([label, value]) => `${label}: ${String(value).trim()}`)
+    .join("\n\n");
+}
+
+function normalizeAgentMetadata(body) {
+  const title = pickText(body, "title", "name") || "Untitled Agent";
+
+  return {
+    title,
+    category: pickText(body, "category", "category") || "general",
+    model: pickText(body, "model", "model") || "unknown",
+    description: pickText(body, "description", "description") || pickText(body, "userDescription", "user_description"),
+    manual: pickText(body, "manual", "manual") || pickText(body, "userManual", "user_manual"),
+    isPublic: parseBoolean(body.isPublic ?? body.is_public, true),
+    toolsIntegrations: pickText(body, "toolsIntegrations", "tools_integrations"),
+    prerequisites: pickText(body, "prerequisites", "prerequisites"),
+    inputFormat: pickText(body, "inputFormat", "input_format"),
+    outputFormat: pickText(body, "outputFormat", "output_format"),
+    useCases: pickText(body, "useCases", "use_cases"),
+    examplePrompts: pickText(body, "examplePrompts", "example_prompts"),
+    limitations: pickText(body, "limitations", "limitations"),
+    whenToUse: pickText(body, "whenToUse", "when_to_use"),
+    whenNotToUse: pickText(body, "whenNotToUse", "when_not_to_use"),
+    setupInstructions: pickText(body, "setupInstructions", "setup_instructions"),
+    expectedUsers: pickText(body, "expectedUsers", "expected_users"),
+    tags: parseTags(body.tags)
+  };
+}
+
+function normalizeAiText(value) {
+  if (value === undefined || value === null) {
+    return "";
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n");
+  }
+
+  return String(value).trim();
+}
+
+function normalizeAiArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  }
+
+  if (typeof value === "string") {
+    return parseTags(value);
+  }
+
+  return [];
+}
+
+function extractJsonObject(rawText) {
+  let cleanJsonString = String(rawText || "").trim();
+
+  if (cleanJsonString.startsWith("```")) {
+    cleanJsonString = cleanJsonString
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```$/i, "")
+      .trim();
+  }
+
+  if (cleanJsonString.includes("{")) {
+    const firstBracket = cleanJsonString.indexOf("{");
+    const lastBracket = cleanJsonString.lastIndexOf("}");
+    cleanJsonString = cleanJsonString.substring(firstBracket, lastBracket + 1);
+  }
+
+  return JSON.parse(cleanJsonString);
+}
+
+function mergeAnalyzedMetadata(metadata, parsedAiResult) {
+  return {
+    title: normalizeAiText(parsedAiResult.title) || metadata.title,
+    category: normalizeAiText(parsedAiResult.category) || metadata.category,
+    model: normalizeAiText(parsedAiResult.model) || metadata.model,
+    description: normalizeAiText(parsedAiResult.description) || metadata.description,
+    manual: normalizeAiText(parsedAiResult.manual) || metadata.manual,
+    toolsIntegrations: normalizeAiText(parsedAiResult.toolsIntegrations) || metadata.toolsIntegrations,
+    prerequisites: normalizeAiText(parsedAiResult.prerequisites) || metadata.prerequisites,
+    inputFormat: normalizeAiText(parsedAiResult.inputFormat) || metadata.inputFormat,
+    outputFormat: normalizeAiText(parsedAiResult.outputFormat) || metadata.outputFormat,
+    useCases: normalizeAiText(parsedAiResult.useCases) || metadata.useCases,
+    examplePrompts: normalizeAiText(parsedAiResult.examplePrompts) || metadata.examplePrompts,
+    limitations: normalizeAiText(parsedAiResult.limitations) || metadata.limitations,
+    whenToUse: normalizeAiText(parsedAiResult.whenToUse) || metadata.whenToUse,
+    whenNotToUse: normalizeAiText(parsedAiResult.whenNotToUse) || metadata.whenNotToUse,
+    setupInstructions: normalizeAiText(parsedAiResult.setupInstructions) || metadata.setupInstructions,
+    expectedUsers: normalizeAiText(parsedAiResult.expectedUsers) || metadata.expectedUsers,
+    tags: parseTags(parsedAiResult.tags?.length ? parsedAiResult.tags : metadata.tags),
+    missingFields: normalizeAiArray(parsedAiResult.missingFields),
+    warnings: normalizeAiArray(parsedAiResult.warnings),
+    suggestedSearchQueries: normalizeAiArray(parsedAiResult.suggestedSearchQueries)
+  };
+}
+
+async function analyzeAgentWithAI(apiKey, fileContent, metadata) {
+  const systemPrompt = `You are an expert AI agent marketplace reviewer.
+Analyze the uploaded agent file and the user-provided metadata.
+Return ONLY one raw JSON object. Do not include markdown, backticks, prose, or a JSON wrapper.
+
+The JSON object must use these exact keys:
+title, category, model, description, manual, toolsIntegrations, prerequisites, inputFormat, outputFormat, useCases, examplePrompts, limitations, whenToUse, whenNotToUse, setupInstructions, expectedUsers, tags, missingFields, warnings, suggestedSearchQueries.
+
+String fields must be concise and useful for a marketplace listing.
+tags, missingFields, warnings, and suggestedSearchQueries must be arrays of strings.
+Prefer the user's supplied metadata when it is accurate, but fill gaps from the file content.`;
+
+  const aiResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey.trim()}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://localhost:5000",
+      "X-Title": "AgentSharePointHackathon"
+    },
+    body: JSON.stringify({
+      model: "anthropic/claude-3.5-sonnet",
+      models: [
+        "anthropic/claude-3.5-sonnet",
+        "anthropic/claude-3.5-haiku",
+        "openai/gpt-4o"
+      ],
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: JSON.stringify({
+            userMetadata: metadata,
+            agentFileContent: fileContent
+          })
+        }
+      ],
+      temperature: 0.2,
+      max_tokens: 4096
+    })
+  });
+
+  const aiData = await aiResponse.json();
+
+  if (!aiResponse.ok || aiData.error) {
+    console.error("[OpenRouter Analyze Error]:", aiData.error || aiData);
+    throw new Error(aiData.error?.message || "OpenRouter analysis request failed.");
+  }
+
+  if (!aiData?.choices?.[0]?.message?.content) {
+    console.error("[OpenRouter Analyze Structural Mismatch]:", aiData);
+    throw new Error("OpenRouter analysis response did not include usable content.");
+  }
+
+  try {
+    const parsedAiResult = extractJsonObject(aiData.choices[0].message.content);
+    return mergeAnalyzedMetadata(metadata, parsedAiResult);
+  } catch (jsonParseError) {
+    console.error("[OpenRouter Analyze JSON Parse Error]:", jsonParseError.message);
+    throw new Error("OpenRouter analysis response was not valid JSON.");
+  }
+}
+
 async function generateEmbedding(apiKey, input) {
   const embeddingResponse = await fetch("https://openrouter.ai/api/v1/embeddings", {
     method: "POST",
@@ -57,6 +324,17 @@ async function generateEmbedding(apiKey, input) {
   throw new Error("Failed validation on semantic vector assembly generation step.");
 }
 
+function getOpenRouterApiKey() {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+
+  if (!apiKey || apiKey.includes("your_actual")) {
+    console.error("[CRITICAL] OPENROUTER_API_KEY is missing or still set to a placeholder.");
+    return null;
+  }
+
+  return apiKey;
+}
+
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -76,101 +354,51 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
+app.post('/api/agents/analyze', upload.single('agentFile'), async (req, res) => {
   try {
-    const { title, userDescription, userManual, useAiGeneration } = req.body;
-
     if (!req.file) {
       return res.status(400).json({ error: "Please upload an agent file script." });
     }
 
-    const fileContent = req.file.buffer.toString('utf-8');
-    let finalDescription = userDescription || "";
-    let finalManual = userManual || "";
+    const apiKey = getOpenRouterApiKey();
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey || apiKey.includes("your_actual")) {
-      console.error("[CRITICAL] Your OPENROUTER_API_KEY inside the .env file is missing or default!");
+    if (!apiKey) {
       return res.status(500).json({ error: "Backend configuration error: API key missing." });
     }
 
-    if (useAiGeneration === 'true' || useAiGeneration === true) {
-      console.log(`[AI] Dispatching code request to Claude 3.5 Sonnet...`);
-      
-      const systemPrompt = `You are an expert AI solution architect. Analyze the provided source code file. 
-You must return a valid JSON object with EXACTLY two keys:
-"suggested_description": A catchy, 2-3 sentence marketing summary of what this agent does for a non-technical user.
-"suggested_manual": A beautiful, step-by-step Markdown guide on how to configure, run, and interact with this agent.
+    const fileContent = req.file.buffer.toString('utf-8');
+    const metadata = normalizeAgentMetadata(req.body);
+    const analyzedMetadata = await analyzeAgentWithAI(apiKey, fileContent, metadata);
 
-Return ONLY raw JSON text data. Do not include markdown code block backticks (like \`\`\`) or the word "json" in your response wrapper.`;
+    return res.status(200).json({
+      message: "Agent analyzed successfully",
+      data: analyzedMetadata
+    });
+  } catch (error) {
+    console.error("Agent Analyze Exception Stack:", error);
+    return res.status(500).json({ error: "Agent analysis failed", details: error.message });
+  }
+});
 
-      const aiResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey.trim()}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://localhost:5000", 
-          "X-Title": "AgentSharePointHackathon"      
-        },
-        body: JSON.stringify({
-          model: "anthropic/claude-3.5-sonnet",
-          models: [
-            "anthropic/claude-3.5-sonnet",
-            "anthropic/claude-3.5-haiku",
-            "openai/gpt-4o"
-          ],
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: `Here is the agent code file content:\n\n${fileContent}` }
-          ],
-          temperature: 0.3,
-          max_tokens: 2048
-        })
-      });
-
-      const aiData = await aiResponse.json();
-      
-      if (aiData.error) {
-        console.error("--- OPENROUTER REJECTION DETAILS ---");
-        console.log(JSON.stringify(aiData.error, null, 2)); // FIXED: Changed print() to console.log()
-        return res.status(400).json({ error: "OpenRouter provider rejected request", details: aiData.error.message });
-      }
-
-      if (aiData && aiData.choices && aiData.choices[0] && aiData.choices[0].message) {
-        let rawJsonText = aiData.choices[0].message.content.trim();
-        
-        if (rawJsonText.startsWith("```")) {
-          rawJsonText = rawJsonText.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
-        }
-
-        try {
-            // Clean up any weird invisible spaces, line breaks, or markdown block hangers
-            let cleanJsonString = rawJsonText.trim();
-            
-            // Regex fallback: If Claude wrapped the JSON inside ```json ... ``` blocks anyway, extract just the object
-            if (cleanJsonString.includes("{")) {
-              const firstBracket = cleanJsonString.indexOf("{");
-              const lastBracket = cleanJsonString.lastIndexOf("}");
-              cleanJsonString = cleanJsonString.substring(firstBracket, lastBracket + 1);
-            }
-  
-            const parsedAiResult = JSON.parse(cleanJsonString);
-            
-            finalDescription = userDescription || parsedAiResult.suggested_description;
-            finalManual = userManual || parsedAiResult.suggested_manual;
-          } catch (jsonParseErr) {
-            console.error("[CRITICAL JSON CRASH] Claude string failed to parse. Raw output was:", rawJsonText);
-            throw new Error("Formatting constraints fell out of standard parsable parameters.");
-          }
-      } else {
-        console.error("[Diagnostic Log] Raw structural mismatch payload return:", aiData);
-        throw new Error("Returned structured array state configuration error or drop.");
-      }
+app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "Please upload an agent file script." });
     }
 
+    const apiKey = getOpenRouterApiKey();
+
+    if (!apiKey) {
+      return res.status(500).json({ error: "Backend configuration error: API key missing." });
+    }
+
+    const fileContent = req.file.buffer.toString('utf-8');
+    const metadata = normalizeAgentMetadata(req.body);
+    const fileContentSummary = fileContent.slice(0, 4000);
+    const indexedText = buildIndexedText({ ...metadata, fileContentSummary });
+
     console.log("[Embedding] Contacting text embedding services...");
-    const textToEmbed = `Title: ${title}\nDescription: ${finalDescription}\nManual: ${finalManual}`;
-    const vectorArray = await generateEmbedding(apiKey, textToEmbed);
+    const vectorArray = await generateEmbedding(apiKey, indexedText);
     const pgVector = toPgVector(vectorArray);
 
     const client = await pool.connect();
@@ -189,20 +417,66 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
           model,
           file_name,
           file_content,
-          is_public
+          is_public,
+          tools_integrations,
+          prerequisites,
+          input_format,
+          output_format,
+          use_cases,
+          example_prompts,
+          limitations,
+          when_to_use,
+          when_not_to_use,
+          setup_instructions,
+          expected_users,
+          tags
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id, name, description, manual`,
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        RETURNING
+          id,
+          name,
+          name AS title,
+          description,
+          manual,
+          category,
+          model,
+          file_name,
+          is_public,
+          tools_integrations AS "toolsIntegrations",
+          prerequisites,
+          input_format AS "inputFormat",
+          output_format AS "outputFormat",
+          use_cases AS "useCases",
+          example_prompts AS "examplePrompts",
+          limitations,
+          when_to_use AS "whenToUse",
+          when_not_to_use AS "whenNotToUse",
+          setup_instructions AS "setupInstructions",
+          expected_users AS "expectedUsers",
+          tags,
+          created_at`,
         [
           1,
-          title,
-          finalDescription,
-          finalManual,
-          req.body.category || "general",
-          req.body.model || "unknown",
+          metadata.title,
+          metadata.description,
+          metadata.manual,
+          metadata.category,
+          metadata.model,
           req.file.originalname,
           fileContent,
-          true
+          metadata.isPublic,
+          metadata.toolsIntegrations,
+          metadata.prerequisites,
+          metadata.inputFormat,
+          metadata.outputFormat,
+          metadata.useCases,
+          metadata.examplePrompts,
+          metadata.limitations,
+          metadata.whenToUse,
+          metadata.whenNotToUse,
+          metadata.setupInstructions,
+          metadata.expectedUsers,
+          metadata.tags
         ]
       );
 
@@ -218,7 +492,7 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
         VALUES ($1, $2, $3::vector, $4)`,
         [
           savedAgent.id,
-          textToEmbed,
+          indexedText,
           pgVector,
           "openai/text-embedding-3-small"
         ]
@@ -231,24 +505,23 @@ Return ONLY raw JSON text data. Do not include markdown code block backticks (li
     } finally {
       client.release();
     }
-    
-    console.log(`[Success] Processed and saved agent "${title}" successfully!`);
-    
+
+    console.log(`[Success] Saved agent "${metadata.title}" successfully.`);
+
     return res.status(200).json({
-      message: "Agent processed and saved successfully!",
+      message: "Agent saved successfully",
       data: {
+        agent: savedAgent,
         id: savedAgent.id,
-        title,
-        description: finalDescription,
-        manual: finalManual,
-        vectorLength: vectorArray.length,
-        vectorPreview: vectorArray.slice(0, 5)
+        title: savedAgent.title,
+        description: savedAgent.description,
+        manual: savedAgent.manual,
+        vectorLength: vectorArray.length
       }
     });
-
   } catch (error) {
-    console.error("Pipeline Exception Stack:", error);
-    return res.status(500).json({ error: "Internal Server Error", details: error.message });
+    console.error("Agent Upload Exception Stack:", error);
+    return res.status(500).json({ error: "Agent upload failed", details: error.message });
   }
 });
 
@@ -263,7 +536,8 @@ app.get('/api/agents', async (req, res) => {
         model,
         file_name,
         is_public,
-        created_at
+        created_at,
+        tags
       FROM agents
       WHERE is_public = TRUE
       ORDER BY created_at DESC`
@@ -282,12 +556,25 @@ app.get('/api/agents/:id', async (req, res) => {
       `SELECT
         a.id,
         a.name,
+        a.name AS title,
         a.description,
         a.manual,
         a.category,
         a.model,
         a.file_name,
         a.is_public,
+        a.tools_integrations AS "toolsIntegrations",
+        a.prerequisites,
+        a.input_format AS "inputFormat",
+        a.output_format AS "outputFormat",
+        a.use_cases AS "useCases",
+        a.example_prompts AS "examplePrompts",
+        a.limitations,
+        a.when_to_use AS "whenToUse",
+        a.when_not_to_use AS "whenNotToUse",
+        a.setup_instructions AS "setupInstructions",
+        a.expected_users AS "expectedUsers",
+        a.tags,
         a.created_at,
         e.indexed_text,
         e.embedding_model
@@ -316,9 +603,9 @@ app.post('/api/agents/search', async (req, res) => {
       return res.status(400).json({ error: "Search query is required." });
     }
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey || apiKey.includes("your_actual")) {
-      console.error("[CRITICAL] Your OPENROUTER_API_KEY inside the .env file is missing or default!");
+    const apiKey = getOpenRouterApiKey();
+
+    if (!apiKey) {
       return res.status(500).json({ error: "Backend configuration error: API key missing." });
     }
 
@@ -333,6 +620,7 @@ app.post('/api/agents/search', async (req, res) => {
         a.category,
         a.model,
         a.file_name,
+        a.tags,
         1 - (e.embedding <=> $1::vector(1536)) AS similarity
       FROM agents a
       JOIN agent_embeddings e ON e.agent_id = a.id
@@ -352,6 +640,7 @@ app.post('/api/agents/search', async (req, res) => {
         category: agent.category,
         model: agent.model,
         file_name: agent.file_name,
+        tags: agent.tags || [],
         similarity: Number(agent.similarity),
         reason: "Matched by semantic similarity to the search query."
       }))
