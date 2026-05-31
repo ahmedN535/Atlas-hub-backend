@@ -59,6 +59,41 @@ function parseBoolean(value, defaultValue) {
   return defaultValue;
 }
 
+function getCurrentUserId(req) {
+  const rawUserId = req.header("x-user-id") || req.query.userId || "1";
+  const userId = Number(rawUserId);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return 1;
+  }
+
+  return userId;
+}
+
+function normalizeVisibility(body) {
+  const rawVisibility = body.visibility || body.agentVisibility;
+
+  if (rawVisibility === "private") return "private";
+  if (rawVisibility === "followers") return "followers";
+  if (rawVisibility === "public") return "public";
+
+  if (body.isPublic === false || body.isPublic === "false" || body.is_public === false || body.is_public === "false") {
+    return "private";
+  }
+
+  return "public";
+}
+
+function isPublicFromVisibility(visibility) {
+  return visibility === "public";
+}
+
+function assertValidVisibility(visibility) {
+  if (!["public", "private", "followers"].includes(visibility)) {
+    throw new Error("Invalid visibility. Use public, private, or followers.");
+  }
+}
+
 function parseTags(value) {
   if (value === undefined || value === null || value === "") {
     return [];
@@ -354,6 +389,205 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+app.post('/api/users/:id/follow', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    if (targetUserId === currentUserId) {
+      return res.status(400).json({ error: "You cannot follow yourself" });
+    }
+
+    const targetUser = await pool.query(
+      `SELECT id, username, email
+      FROM users
+      WHERE id = $1`,
+      [targetUserId]
+    );
+
+    if (targetUser.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    await pool.query(
+      `INSERT INTO follows (follower_id, following_id)
+      VALUES ($1, $2)
+      ON CONFLICT DO NOTHING`,
+      [currentUserId, targetUserId]
+    );
+
+    res.status(200).json({
+      message: "User followed successfully",
+      following: targetUser.rows[0]
+    });
+  } catch (error) {
+    console.error("User Follow Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.delete('/api/users/:id/follow', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    await pool.query(
+      `DELETE FROM follows
+      WHERE follower_id = $1
+        AND following_id = $2`,
+      [currentUserId, targetUserId]
+    );
+
+    res.status(200).json({
+      message: "User unfollowed successfully",
+      following_id: targetUserId
+    });
+  } catch (error) {
+    console.error("User Unfollow Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.get('/api/users/:id/followers', async (req, res) => {
+  try {
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    const result = await pool.query(
+      `SELECT
+        u.id,
+        u.username,
+        u.email,
+        f.created_at AS followed_at
+      FROM follows f
+      JOIN users u ON u.id = f.follower_id
+      WHERE f.following_id = $1
+      ORDER BY f.created_at DESC`,
+      [targetUserId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("User Followers Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.get('/api/users/:id/following', async (req, res) => {
+  try {
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    const result = await pool.query(
+      `SELECT
+        u.id,
+        u.username,
+        u.email,
+        f.created_at AS followed_at
+      FROM follows f
+      JOIN users u ON u.id = f.following_id
+      WHERE f.follower_id = $1
+      ORDER BY f.created_at DESC`,
+      [targetUserId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("User Following Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    const result = await pool.query(
+      `SELECT
+        u.id,
+        u.username,
+        u.email,
+        COUNT(DISTINCT followers.follower_id)::int AS follower_count,
+        COUNT(DISTINCT following.following_id)::int AS following_count,
+        EXISTS (
+          SELECT 1
+          FROM follows current_follow
+          WHERE current_follow.follower_id = $2
+            AND current_follow.following_id = u.id
+        ) AS is_following
+      FROM users u
+      LEFT JOIN follows followers ON followers.following_id = u.id
+      LEFT JOIN follows following ON following.follower_id = u.id
+      WHERE u.id = $1
+      GROUP BY u.id, u.username, u.email`,
+      [targetUserId, currentUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("User Detail Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.get('/api/feed/following', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+
+    const result = await pool.query(
+      `SELECT
+        a.id,
+        a.name,
+        a.description,
+        a.category,
+        a.model,
+        a.file_name,
+        a.is_public,
+        a.visibility,
+        a.user_id,
+        u.username AS owner_username,
+        a.created_at,
+        a.tags
+      FROM follows f
+      JOIN agents a ON a.user_id = f.following_id
+      LEFT JOIN users u ON u.id = a.user_id
+      WHERE f.follower_id = $1
+        AND a.deleted_at IS NULL
+        AND a.visibility IN ('public', 'followers')
+      ORDER BY a.created_at DESC`,
+      [currentUserId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Following Feed Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
 app.post('/api/agents/analyze', upload.single('agentFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -385,6 +619,11 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "Please upload an agent file script." });
     }
+
+    const currentUserId = getCurrentUserId(req);
+    const visibility = normalizeVisibility(req.body);
+    assertValidVisibility(visibility);
+    const isPublic = isPublicFromVisibility(visibility);
 
     const apiKey = getOpenRouterApiKey();
 
@@ -418,6 +657,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           file_name,
           file_content,
           is_public,
+          visibility,
           tools_integrations,
           prerequisites,
           input_format,
@@ -431,7 +671,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           expected_users,
           tags
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         RETURNING
           id,
           name,
@@ -442,6 +682,8 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           model,
           file_name,
           is_public,
+          is_public AS "isPublic",
+          visibility,
           tools_integrations AS "toolsIntegrations",
           prerequisites,
           input_format AS "inputFormat",
@@ -456,7 +698,7 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           tags,
           created_at`,
         [
-          1,
+          currentUserId,
           metadata.title,
           metadata.description,
           metadata.manual,
@@ -464,7 +706,8 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           metadata.model,
           req.file.originalname,
           fileContent,
-          metadata.isPublic,
+          isPublic,
+          visibility,
           metadata.toolsIntegrations,
           metadata.prerequisites,
           metadata.inputFormat,
@@ -514,6 +757,10 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
         agent: savedAgent,
         id: savedAgent.id,
         title: savedAgent.title,
+        name: savedAgent.name,
+        visibility: savedAgent.visibility,
+        isPublic: savedAgent.isPublic,
+        is_public: savedAgent.is_public,
         description: savedAgent.description,
         manual: savedAgent.manual,
         vectorLength: vectorArray.length
@@ -527,20 +774,40 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
 
 app.get('/api/agents', async (req, res) => {
   try {
+    const currentUserId = getCurrentUserId(req);
+
     const result = await pool.query(
       `SELECT
-        id,
-        name,
-        description,
-        category,
-        model,
-        file_name,
-        is_public,
-        created_at,
-        tags
-      FROM agents
-      WHERE is_public = TRUE
-      ORDER BY created_at DESC`
+        a.id,
+        a.name,
+        a.description,
+        a.category,
+        a.model,
+        a.file_name,
+        a.is_public,
+        a.visibility,
+        a.user_id,
+        u.username AS owner_username,
+        a.created_at,
+        a.tags
+      FROM agents a
+      LEFT JOIN users u ON u.id = a.user_id
+      WHERE a.deleted_at IS NULL
+        AND (
+          a.visibility = 'public'
+          OR a.user_id = $1
+          OR (
+            a.visibility = 'followers'
+            AND EXISTS (
+              SELECT 1
+              FROM follows f
+              WHERE f.follower_id = $1
+                AND f.following_id = a.user_id
+            )
+          )
+        )
+      ORDER BY a.created_at DESC`,
+      [currentUserId]
     );
 
     res.json(result.rows);
@@ -550,11 +817,133 @@ app.get('/api/agents', async (req, res) => {
   }
 });
 
+app.get('/api/me/agents', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+
+    const result = await pool.query(
+      `SELECT
+        id,
+        name,
+        description,
+        category,
+        model,
+        file_name,
+        is_public,
+        visibility,
+        created_at,
+        updated_at,
+        tags
+      FROM agents
+      WHERE user_id = $1
+        AND deleted_at IS NULL
+      ORDER BY created_at DESC`,
+      [currentUserId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("My Agents List Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.patch('/api/agents/:id/visibility', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const agentId = Number(req.params.id);
+
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      return res.status(400).json({ error: "Agent id must be a positive integer" });
+    }
+
+    const visibility = normalizeVisibility(req.body);
+    assertValidVisibility(visibility);
+    const isPublic = isPublicFromVisibility(visibility);
+
+    const result = await pool.query(
+      `UPDATE agents
+      SET
+        visibility = $3,
+        is_public = $4,
+        updated_at = NOW()
+      WHERE id = $1
+        AND user_id = $2
+        AND deleted_at IS NULL
+      RETURNING
+        id,
+        name,
+        user_id,
+        visibility,
+        is_public,
+        updated_at`,
+      [agentId, currentUserId, visibility, isPublic]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Agent not found or you do not have permission to update it" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Agent Visibility Update Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
+app.delete('/api/agents/:id', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const agentId = Number(req.params.id);
+
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      return res.status(400).json({ error: "Agent id must be a positive integer" });
+    }
+
+    const result = await pool.query(
+      `UPDATE agents
+      SET
+        deleted_at = NOW(),
+        is_public = false,
+        visibility = 'private',
+        updated_at = NOW()
+      WHERE id = $1
+        AND user_id = $2
+        AND deleted_at IS NULL
+      RETURNING
+        id,
+        name,
+        deleted_at`,
+      [agentId, currentUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Agent not found or you do not have permission to delete it" });
+    }
+
+    res.json({
+      message: "Agent deleted successfully",
+      agent: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Agent Delete Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
 app.get('/api/agents/:id', async (req, res) => {
   try {
+    const currentUserId = getCurrentUserId(req);
+    const agentId = Number(req.params.id);
+
+    if (!Number.isInteger(agentId) || agentId <= 0) {
+      return res.status(400).json({ error: "Agent id must be a positive integer" });
+    }
+
     const result = await pool.query(
       `SELECT
         a.id,
+        a.user_id,
         a.name,
         a.name AS title,
         a.description,
@@ -563,6 +952,8 @@ app.get('/api/agents/:id', async (req, res) => {
         a.model,
         a.file_name,
         a.is_public,
+        a.visibility,
+        u.username AS owner_username,
         a.tools_integrations AS "toolsIntegrations",
         a.prerequisites,
         a.input_format AS "inputFormat",
@@ -576,16 +967,33 @@ app.get('/api/agents/:id', async (req, res) => {
         a.expected_users AS "expectedUsers",
         a.tags,
         a.created_at,
+        a.updated_at,
+        a.deleted_at,
         e.indexed_text,
         e.embedding_model
       FROM agents a
+      LEFT JOIN users u ON u.id = a.user_id
       LEFT JOIN agent_embeddings e ON e.agent_id = a.id
-      WHERE a.id = $1 AND a.is_public = TRUE`,
-      [req.params.id]
+      WHERE a.id = $1
+        AND a.deleted_at IS NULL
+        AND (
+          a.visibility = 'public'
+          OR a.user_id = $2
+          OR (
+            a.visibility = 'followers'
+            AND EXISTS (
+              SELECT 1
+              FROM follows f
+              WHERE f.follower_id = $2
+                AND f.following_id = a.user_id
+            )
+          )
+        )`,
+      [agentId, currentUserId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Agent not found" });
+      return res.status(404).json({ error: "Agent not found or not visible" });
     }
 
     res.json(result.rows[0]);
@@ -598,6 +1006,7 @@ app.get('/api/agents/:id', async (req, res) => {
 app.post('/api/agents/search', async (req, res) => {
   try {
     const { query } = req.body;
+    const currentUserId = getCurrentUserId(req);
 
     if (!query || typeof query !== "string") {
       return res.status(400).json({ error: "Search query is required." });
@@ -620,15 +1029,33 @@ app.post('/api/agents/search', async (req, res) => {
         a.category,
         a.model,
         a.file_name,
+        a.visibility,
+        a.is_public,
+        a.user_id,
+        u.username AS owner_username,
         a.tags,
         1 - (e.embedding <=> $1::vector(1536)) AS similarity
       FROM agents a
       JOIN agent_embeddings e ON e.agent_id = a.id
-      WHERE a.is_public = TRUE
+      LEFT JOIN users u ON u.id = a.user_id
+      WHERE a.deleted_at IS NULL
+        AND (
+          a.visibility = 'public'
+          OR a.user_id = $2
+          OR (
+            a.visibility = 'followers'
+            AND EXISTS (
+              SELECT 1
+              FROM follows f
+              WHERE f.follower_id = $2
+                AND f.following_id = a.user_id
+            )
+          )
+        )
         AND e.embedding IS NOT NULL
       ORDER BY e.embedding <=> $1::vector(1536)
       LIMIT 10`,
-      [queryVector]
+      [queryVector, currentUserId]
     );
 
     res.json({
@@ -640,6 +1067,10 @@ app.post('/api/agents/search', async (req, res) => {
         category: agent.category,
         model: agent.model,
         file_name: agent.file_name,
+        visibility: agent.visibility,
+        is_public: agent.is_public,
+        user_id: agent.user_id,
+        owner_username: agent.owner_username,
         tags: agent.tags || [],
         similarity: Number(agent.similarity),
         reason: "Matched by semantic similarity to the search query."
