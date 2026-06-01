@@ -179,49 +179,80 @@ function assertValidVisibility(visibility) {
 
 function visibleAgentSql(alias = "a", currentUserParam = "$1") {
   return `(
-    ${alias}.visibility = 'public'
-    OR (
-      ${alias}.visibility = 'private'
-      AND ${alias}.user_id::text = ${currentUserParam}::text
-    )
-    OR (
-      ${alias}.visibility = 'followers'
-      AND (
-        ${alias}.user_id::text = ${currentUserParam}::text
-        OR EXISTS (
-          SELECT 1
-          FROM follows f
-          WHERE f.follower_id::text = ${currentUserParam}::text
-            AND f.following_id::text = ${alias}.user_id::text
-        )
+    ${alias}.deleted_at IS NULL
+    AND (
+      ${alias}.visibility = 'public'
+      OR (
+        ${alias}.visibility = 'private'
+        AND ${alias}.user_id::text = ${currentUserParam}::text
       )
-    )
-    OR (
-      ${alias}.visibility = 'org_only'
-      AND (
-        ${alias}.user_id::text = ${currentUserParam}::text
-        OR (
-          ${alias}.org_id IS NOT NULL
-          AND EXISTS (
+      OR (
+        ${alias}.visibility = 'followers'
+        AND (
+          ${alias}.user_id::text = ${currentUserParam}::text
+          OR EXISTS (
             SELECT 1
-            FROM organization_members om
-            WHERE om.org_id = ${alias}.org_id
-              AND om.user_id::text = ${currentUserParam}::text
+            FROM follows f
+            WHERE f.follower_id::text = ${currentUserParam}::text
+              AND f.following_id::text = ${alias}.user_id::text
           )
         )
       )
-    )
-    OR (
-      ${alias}.visibility = 'group_only'
-      AND ${alias}.group_id IS NOT NULL
-      AND EXISTS (
-        SELECT 1
-        FROM group_members gm
-        WHERE gm.group_id = ${alias}.group_id
-          AND gm.user_id::text = ${currentUserParam}::text
+      OR (
+        ${alias}.visibility = 'org_only'
+        AND (
+          ${alias}.user_id::text = ${currentUserParam}::text
+          OR (
+            ${alias}.org_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM organization_members om
+              WHERE om.org_id = ${alias}.org_id
+                AND om.user_id::text = ${currentUserParam}::text
+            )
+          )
+        )
+      )
+      OR (
+        ${alias}.visibility = 'group_only'
+        AND ${alias}.group_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM group_members gm
+          WHERE gm.group_id = ${alias}.group_id
+            AND gm.user_id::text = ${currentUserParam}::text
+        )
       )
     )
   )`;
+}
+
+async function getUserFollowSummary(client, targetUserId, currentUserId) {
+  const result = await client.query(
+    `SELECT
+      (
+        SELECT COUNT(*)::int
+        FROM follows followers
+        WHERE followers.following_id::text = $1::text
+      ) AS follower_count,
+      (
+        SELECT COUNT(*)::int
+        FROM follows following
+        WHERE following.follower_id::text = $1::text
+      ) AS following_count,
+      CASE
+        WHEN $1::text = $2::text THEN false
+        ELSE EXISTS (
+          SELECT 1
+          FROM follows current_follow
+          WHERE current_follow.follower_id::text = $2::text
+            AND current_follow.following_id::text = $1::text
+        )
+      END AS is_following`,
+    [targetUserId, currentUserId]
+  );
+
+  return result.rows[0];
 }
 
 function parseNullableId(value) {
@@ -383,7 +414,15 @@ async function getOrganizationMembers(client, orgId) {
 
 async function getOrganizationAgents(client, orgId, userId) {
   const result = await client.query(
-    `SELECT
+    `WITH review_stats AS (
+      SELECT
+        agent_id,
+        COUNT(*)::int AS review_count,
+        COALESCE(AVG(rating_x2) / 2.0, 0)::float AS average_rating
+      FROM agent_reviews
+      GROUP BY agent_id
+    )
+    SELECT
       a.id,
       a.name,
       a.description,
@@ -401,10 +440,13 @@ async function getOrganizationAgents(client, orgId, userId) {
       u.display_name AS uploader_name,
       u.display_name AS team,
       a.tags,
-      a.created_at
+      a.created_at,
+      COALESCE(rs.review_count, 0) AS review_count,
+      COALESCE(rs.average_rating, 0) AS average_rating
     FROM agents a
     LEFT JOIN users u ON u.id = a.user_id
     LEFT JOIN groups g ON g.id = a.group_id
+    LEFT JOIN review_stats rs ON rs.agent_id = a.id
     WHERE a.org_id = $1
       AND a.deleted_at IS NULL
       AND ${visibleAgentSql("a", "$2")}
@@ -818,7 +860,13 @@ app.post('/api/users/:id/follow', async (req, res) => {
       [currentUserId, targetUserId]
     );
 
+    const followSummary = await getUserFollowSummary(pool, targetUserId, currentUserId);
+
     res.status(200).json({
+      success: true,
+      is_following: true,
+      follower_count: followSummary.follower_count,
+      following_count: followSummary.following_count,
       message: "User followed successfully",
       following: targetUser.rows[0]
     });
@@ -837,6 +885,17 @@ app.delete('/api/users/:id/follow', async (req, res) => {
       return res.status(400).json({ error: "User id must be a positive integer" });
     }
 
+    const targetUser = await pool.query(
+      `SELECT id
+      FROM users
+      WHERE id = $1`,
+      [targetUserId]
+    );
+
+    if (targetUser.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
     await pool.query(
       `DELETE FROM follows
       WHERE follower_id = $1
@@ -844,7 +903,13 @@ app.delete('/api/users/:id/follow', async (req, res) => {
       [currentUserId, targetUserId]
     );
 
+    const followSummary = await getUserFollowSummary(pool, targetUserId, currentUserId);
+
     res.status(200).json({
+      success: true,
+      is_following: false,
+      follower_count: followSummary.follower_count,
+      following_count: followSummary.following_count,
       message: "User unfollowed successfully",
       following_id: targetUserId
     });
@@ -1104,15 +1169,18 @@ app.get('/api/users/:id', async (req, res) => {
         u.created_at,
         COUNT(DISTINCT followers.follower_id)::int AS follower_count,
         COUNT(DISTINCT following.following_id)::int AS following_count,
-        EXISTS (
-          SELECT 1
-          FROM follows current_follow
-          WHERE current_follow.follower_id = $2
-            AND current_follow.following_id = u.id
-        ) AS is_following
+        CASE
+          WHEN $2::text = u.id::text THEN false
+          ELSE EXISTS (
+            SELECT 1
+            FROM follows current_follow
+            WHERE current_follow.follower_id::text = $2::text
+              AND current_follow.following_id::text = u.id::text
+          )
+        END AS is_following
       FROM users u
-      LEFT JOIN follows followers ON followers.following_id = u.id
-      LEFT JOIN follows following ON following.follower_id = u.id
+      LEFT JOIN follows followers ON followers.following_id::text = u.id::text
+      LEFT JOIN follows following ON following.follower_id::text = u.id::text
       WHERE u.id = $1
       GROUP BY u.id, u.username, u.email, u.display_name, u.bio, u.created_at`,
       [targetUserId, currentUserId]
@@ -1134,7 +1202,15 @@ app.get('/api/feed/following', async (req, res) => {
     const currentUserId = getCurrentUserId(req);
 
     const result = await pool.query(
-      `SELECT
+      `WITH review_stats AS (
+        SELECT
+          agent_id,
+          COUNT(*)::int AS review_count,
+          COALESCE(AVG(rating_x2) / 2.0, 0)::float AS average_rating
+        FROM agent_reviews
+        GROUP BY agent_id
+      )
+      SELECT
         a.id,
         a.name,
         a.description,
@@ -1144,14 +1220,24 @@ app.get('/api/feed/following', async (req, res) => {
         a.is_public,
         a.visibility,
         a.org_id,
+        o.name AS org_name,
+        a.group_id,
+        g.name AS group_name,
         a.user_id,
         u.username AS owner_username,
+        u.display_name AS owner_display_name,
+        u.display_name AS uploader_name,
         a.created_at,
-        a.tags
+        a.tags,
+        COALESCE(rs.review_count, 0) AS review_count,
+        COALESCE(rs.average_rating, 0) AS average_rating
       FROM follows f
-      JOIN agents a ON a.user_id = f.following_id
+      JOIN agents a ON a.user_id::text = f.following_id::text
       LEFT JOIN users u ON u.id = a.user_id
-      WHERE f.follower_id = $1
+      LEFT JOIN organizations o ON o.id = a.org_id
+      LEFT JOIN groups g ON g.id = a.group_id
+      LEFT JOIN review_stats rs ON rs.agent_id = a.id
+      WHERE f.follower_id::text = $1::text
         AND a.deleted_at IS NULL
         AND ${visibleAgentSql("a", "$1")}
       ORDER BY a.created_at DESC`,
@@ -1515,6 +1601,83 @@ app.get('/api/me/agents', async (req, res) => {
     res.status(500).json({ error: "Internal Server Error", details: error.message });
   }
 });
+
+async function getVisibleUserAgents(profileUserId, currentUserId) {
+  const result = await pool.query(
+    `WITH review_stats AS (
+      SELECT
+        agent_id,
+        COUNT(*)::int AS review_count,
+        COALESCE(AVG(rating_x2) / 2.0, 0)::float AS average_rating
+      FROM agent_reviews
+      GROUP BY agent_id
+    )
+    SELECT
+      a.id,
+      a.name,
+      a.description,
+      a.category,
+      a.model,
+      a.file_name,
+      a.is_public,
+      a.visibility,
+      a.org_id,
+      o.name AS org_name,
+      a.group_id,
+      g.name AS group_name,
+      a.user_id,
+      u.username AS owner_username,
+      u.display_name AS owner_display_name,
+      u.display_name AS uploader_name,
+      a.created_at,
+      a.tags,
+      COALESCE(rs.review_count, 0) AS review_count,
+      COALESCE(rs.average_rating, 0) AS average_rating
+    FROM agents a
+    LEFT JOIN users u ON u.id = a.user_id
+    LEFT JOIN organizations o ON o.id = a.org_id
+    LEFT JOIN groups g ON g.id = a.group_id
+    LEFT JOIN review_stats rs ON rs.agent_id = a.id
+    WHERE a.user_id::text = $1::text
+      AND a.deleted_at IS NULL
+      AND ${visibleAgentSql("a", "$2")}
+    ORDER BY a.created_at DESC`,
+    [profileUserId, currentUserId]
+  );
+
+  return result.rows;
+}
+
+async function getUserAgentsHandler(req, res) {
+  try {
+    const profileUserId = Number(req.params.id);
+    const currentUserId = getCurrentUserId(req);
+
+    if (!Number.isInteger(profileUserId) || profileUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    const userExists = await pool.query(
+      `SELECT id
+      FROM users
+      WHERE id = $1`,
+      [profileUserId]
+    );
+
+    if (userExists.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const agents = await getVisibleUserAgents(profileUserId, currentUserId);
+    res.json(agents);
+  } catch (error) {
+    console.error("User Agents List Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+}
+
+app.get('/api/users/:id/agents', getUserAgentsHandler);
+app.get('/api/users/:id/published-agents', getUserAgentsHandler);
 
 app.get('/api/organizations', async (req, res) => {
   try {

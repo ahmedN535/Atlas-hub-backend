@@ -36,6 +36,26 @@ CREATE TABLE organization_members (
   PRIMARY KEY (org_id, user_id)
 );
 
+CREATE TABLE groups (
+  id BIGSERIAL PRIMARY KEY,
+  org_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (org_id, slug)
+);
+
+CREATE TABLE group_members (
+  group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+  joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (group_id, user_id)
+);
+
 CREATE TABLE agents (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -66,12 +86,13 @@ CREATE TABLE agents (
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
   visibility TEXT NOT NULL DEFAULT 'public',
   org_id BIGINT REFERENCES organizations(id) ON DELETE SET NULL,
+  group_id BIGINT REFERENCES groups(id) ON DELETE SET NULL,
   deleted_at TIMESTAMPTZ,
 
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-  CONSTRAINT agents_visibility_check CHECK (visibility IN ('public', 'private', 'followers', 'org_only'))
+  CONSTRAINT agents_visibility_check CHECK (visibility IN ('public', 'private', 'followers', 'org_only', 'group_only'))
 );
 
 CREATE TABLE agent_embeddings (
@@ -104,7 +125,10 @@ CREATE INDEX idx_follows_follower_id ON follows(follower_id);
 CREATE INDEX idx_follows_following_id ON follows(following_id);
 CREATE INDEX idx_org_members_user ON organization_members(user_id);
 CREATE INDEX idx_org_members_org ON organization_members(org_id);
+CREATE INDEX groups_org_id_idx ON groups(org_id);
+CREATE INDEX group_members_user_id_idx ON group_members(user_id);
 CREATE INDEX idx_agents_org ON agents(org_id);
+CREATE INDEX agents_group_id_idx ON agents(group_id);
 CREATE INDEX idx_reviews_agent_id ON reviews(agent_id);
 
 -- IVFFlat is intentionally disabled for the hackathon MVP.
