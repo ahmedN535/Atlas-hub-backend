@@ -177,6 +177,53 @@ function assertValidVisibility(visibility) {
   }
 }
 
+function visibleAgentSql(alias = "a", currentUserParam = "$1") {
+  return `(
+    ${alias}.visibility = 'public'
+    OR (
+      ${alias}.visibility = 'private'
+      AND ${alias}.user_id::text = ${currentUserParam}::text
+    )
+    OR (
+      ${alias}.visibility = 'followers'
+      AND (
+        ${alias}.user_id::text = ${currentUserParam}::text
+        OR EXISTS (
+          SELECT 1
+          FROM follows f
+          WHERE f.follower_id::text = ${currentUserParam}::text
+            AND f.following_id::text = ${alias}.user_id::text
+        )
+      )
+    )
+    OR (
+      ${alias}.visibility = 'org_only'
+      AND (
+        ${alias}.user_id::text = ${currentUserParam}::text
+        OR (
+          ${alias}.org_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM organization_members om
+            WHERE om.org_id = ${alias}.org_id
+              AND om.user_id::text = ${currentUserParam}::text
+          )
+        )
+      )
+    )
+    OR (
+      ${alias}.visibility = 'group_only'
+      AND ${alias}.group_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM group_members gm
+        WHERE gm.group_id = ${alias}.group_id
+          AND gm.user_id::text = ${currentUserParam}::text
+      )
+    )
+  )`;
+}
+
 function parseNullableId(value) {
   if (value === undefined || value === null || value === "") return null;
   const numeric = Number(value);
@@ -196,6 +243,20 @@ function slugify(value) {
     .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+function normalizeDemoUsername(value) {
+  const username = String(value || "").trim().toLowerCase();
+
+  if (!username) {
+    return "";
+  }
+
+  if (!/^[a-z0-9_-]+$/.test(username)) {
+    return null;
+  }
+
+  return username.slice(0, 50);
 }
 
 function getSafeDownloadFileName(fileName, agentName, agentId) {
@@ -249,12 +310,12 @@ async function getGroupContext(client, groupId, userId) {
     FROM groups g
     LEFT JOIN group_members gm
       ON gm.group_id = g.id
-      AND gm.user_id = $2
+      AND gm.user_id::text = $2::text
     LEFT JOIN organization_members om
       ON om.org_id = g.org_id
       AND om.user_id = $2::text
     WHERE g.id = $1`,
-    [groupId, userId]
+    [groupId, String(userId)]
   );
 
   return result.rows[0] || null;
@@ -320,7 +381,7 @@ async function getOrganizationMembers(client, orgId) {
   }));
 }
 
-async function getOrganizationAgents(client, orgId) {
+async function getOrganizationAgents(client, orgId, userId) {
   const result = await client.query(
     `SELECT
       a.id,
@@ -346,8 +407,9 @@ async function getOrganizationAgents(client, orgId) {
     LEFT JOIN groups g ON g.id = a.group_id
     WHERE a.org_id = $1
       AND a.deleted_at IS NULL
+      AND ${visibleAgentSql("a", "$2")}
     ORDER BY a.created_at DESC`,
-    [orgId]
+    [orgId, userId]
   );
 
   return result.rows;
@@ -376,6 +438,7 @@ async function getOrganizationDetail(client, orgId, userId) {
         FROM agents a
         WHERE a.org_id = o.id
           AND a.deleted_at IS NULL
+          AND ${visibleAgentSql("a", "$2")}
       ) AS agent_count
     FROM organizations o
     LEFT JOIN organization_members om
@@ -392,7 +455,7 @@ async function getOrganizationDetail(client, orgId, userId) {
   const organization = result.rows[0];
   const [members, agents] = await Promise.all([
     getOrganizationMembers(client, orgId),
-    getOrganizationAgents(client, orgId)
+    getOrganizationAgents(client, orgId, userKey)
   ]);
 
   return {
@@ -703,6 +766,27 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+app.get('/api/users', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        id,
+        username,
+        email,
+        display_name,
+        bio,
+        created_at
+      FROM users
+      ORDER BY id ASC`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("User List Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
 app.post('/api/users/:id/follow', async (req, res) => {
   try {
     const currentUserId = getCurrentUserId(req);
@@ -848,39 +932,7 @@ app.get('/api/users/:id/activity', async (req, res) => {
           a.created_at
         FROM agents a
         WHERE a.deleted_at IS NULL
-          AND (
-            a.visibility = 'public'
-            OR a.user_id = $2
-            OR (
-              a.visibility = 'followers'
-              AND EXISTS (
-                SELECT 1
-                FROM follows f
-                WHERE f.follower_id = $2
-                  AND f.following_id = a.user_id
-              )
-            )
-            OR (
-              a.visibility = 'org_only'
-              AND a.org_id IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                FROM organization_members om
-                WHERE om.org_id = a.org_id
-                  AND om.user_id = $2::text
-              )
-            )
-            OR (
-              a.visibility = 'group_only'
-              AND a.group_id IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                FROM group_members gm
-                WHERE gm.group_id = a.group_id
-                  AND gm.user_id = $2
-              )
-            )
-          )
+          AND ${visibleAgentSql("a", "$2")}
       ),
       upload_activity AS (
         SELECT
@@ -938,6 +990,101 @@ app.get('/api/users/:id/activity', async (req, res) => {
   }
 });
 
+app.patch('/api/users/:id', async (req, res) => {
+  try {
+    const currentUserId = getCurrentUserId(req);
+    const targetUserId = Number(req.params.id);
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: "User id must be a positive integer" });
+    }
+
+    if (currentUserId !== targetUserId) {
+      return res.status(403).json({ error: "You can only update your own profile." });
+    }
+
+    const updates = [];
+    const values = [targetUserId];
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "display_name")) {
+      const displayName = String(req.body.display_name || "").trim();
+
+      if (!displayName) {
+        return res.status(400).json({ error: "Display name cannot be empty." });
+      }
+
+      values.push(displayName);
+      updates.push(`display_name = $${values.length}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "username")) {
+      const username = normalizeDemoUsername(req.body.username);
+
+      if (!username) {
+        return res.status(400).json({
+          error: "Username must use lowercase letters, numbers, underscores, or hyphens with no spaces."
+        });
+      }
+
+      values.push(username);
+      updates.push(`username = $${values.length}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "bio")) {
+      values.push(String(req.body.bio || "").trim());
+      updates.push(`bio = $${values.length}`);
+    }
+
+    if (updates.length === 0) {
+      const existing = await pool.query(
+        `SELECT
+          id,
+          username,
+          email,
+          display_name,
+          bio,
+          created_at
+        FROM users
+        WHERE id = $1`,
+        [targetUserId]
+      );
+
+      if (existing.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      return res.json(existing.rows[0]);
+    }
+
+    const result = await pool.query(
+      `UPDATE users
+      SET ${updates.join(", ")}
+      WHERE id = $1
+      RETURNING
+        id,
+        username,
+        email,
+        display_name,
+        bio,
+        created_at`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({ error: "Username is already taken." });
+    }
+
+    console.error("User Update Exception Stack:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
+  }
+});
+
 app.get('/api/users/:id', async (req, res) => {
   try {
     const currentUserId = getCurrentUserId(req);
@@ -952,6 +1099,9 @@ app.get('/api/users/:id', async (req, res) => {
         u.id,
         u.username,
         u.email,
+        u.display_name,
+        u.bio,
+        u.created_at,
         COUNT(DISTINCT followers.follower_id)::int AS follower_count,
         COUNT(DISTINCT following.following_id)::int AS following_count,
         EXISTS (
@@ -964,7 +1114,7 @@ app.get('/api/users/:id', async (req, res) => {
       LEFT JOIN follows followers ON followers.following_id = u.id
       LEFT JOIN follows following ON following.follower_id = u.id
       WHERE u.id = $1
-      GROUP BY u.id, u.username, u.email`,
+      GROUP BY u.id, u.username, u.email, u.display_name, u.bio, u.created_at`,
       [targetUserId, currentUserId]
     );
 
@@ -1003,28 +1153,7 @@ app.get('/api/feed/following', async (req, res) => {
       LEFT JOIN users u ON u.id = a.user_id
       WHERE f.follower_id = $1
         AND a.deleted_at IS NULL
-        AND (
-          a.visibility IN ('public', 'followers')
-          OR (
-            a.visibility = 'org_only'
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $1::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $1
-            )
-          )
-        )
+        AND ${visibleAgentSql("a", "$1")}
       ORDER BY a.created_at DESC`,
       [currentUserId]
     );
@@ -1105,7 +1234,32 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           throw error;
         }
 
-        await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+        const orgExists = await client.query(
+          `SELECT id
+          FROM organizations
+          WHERE id = $1`,
+          [orgId]
+        );
+
+        if (orgExists.rows.length === 0) {
+          const error = new Error("Organization not found.");
+          error.status = 400;
+          throw error;
+        }
+
+        const orgRole = await getOrganizationRole(client, orgId, currentUserId);
+
+        if (orgRole === "member") {
+          const error = new Error("Members can only publish agents to groups they belong to.");
+          error.status = 403;
+          throw error;
+        }
+
+        if (!["owner", "admin"].includes(orgRole)) {
+          const error = new Error("You do not have permission to publish to this organization.");
+          error.status = 403;
+          throw error;
+        }
       }
 
       if (visibility === "group_only") {
@@ -1129,8 +1283,8 @@ app.post('/api/agents/upload', upload.single('agentFile'), async (req, res) => {
           throw error;
         }
 
-        if (!canViewGroup(group)) {
-          const error = new Error("You do not have permission to publish into this group.");
+        if (!group.current_user_group_role) {
+          const error = new Error("You must be a member of this group to publish there.");
           error.status = 403;
           throw error;
         }
@@ -1316,38 +1470,7 @@ app.get('/api/agents', async (req, res) => {
       LEFT JOIN groups g ON g.id = a.group_id
       LEFT JOIN review_stats rs ON rs.agent_id = a.id
       WHERE a.deleted_at IS NULL
-        AND (
-          a.visibility = 'public'
-          OR a.user_id = $1
-          OR (
-            a.visibility = 'followers'
-            AND EXISTS (
-              SELECT 1
-              FROM follows f
-              WHERE f.follower_id = $1
-                AND f.following_id = a.user_id
-            )
-          )
-          OR (
-            a.visibility = 'org_only'
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $1::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $1
-            )
-          )
-        )
+        AND ${visibleAgentSql("a", "$1")}
       ORDER BY a.created_at DESC`,
       [currentUserId]
     );
@@ -1365,23 +1488,24 @@ app.get('/api/me/agents', async (req, res) => {
 
     const result = await pool.query(
       `SELECT
-        id,
-        name,
-        description,
-        category,
-        model,
-        file_name,
-        is_public,
-        visibility,
-        org_id,
-        group_id,
-        created_at,
-        updated_at,
-        tags
-      FROM agents
-      WHERE user_id = $1
-        AND deleted_at IS NULL
-      ORDER BY created_at DESC`,
+        a.id,
+        a.name,
+        a.description,
+        a.category,
+        a.model,
+        a.file_name,
+        a.is_public,
+        a.visibility,
+        a.org_id,
+        a.group_id,
+        a.created_at,
+        a.updated_at,
+        a.tags
+      FROM agents a
+      WHERE a.user_id = $1
+        AND a.deleted_at IS NULL
+        AND ${visibleAgentSql("a", "$1")}
+      ORDER BY a.created_at DESC`,
       [currentUserId]
     );
 
@@ -1416,6 +1540,7 @@ app.get('/api/organizations', async (req, res) => {
       LEFT JOIN agents a
         ON a.org_id = o.id
         AND a.deleted_at IS NULL
+        AND ${visibleAgentSql("a", "$1")}
       WHERE om.user_id = $1
       GROUP BY
         o.id,
@@ -1549,13 +1674,22 @@ app.get('/api/organizations/:orgId/groups', async (req, res) => {
         g.created_by,
         g.created_at,
         g.updated_at,
-        COUNT(gm.user_id)::int AS member_count
+        COUNT(DISTINCT members.user_id)::int AS member_count,
+        viewer.role AS viewer_group_role,
+        (viewer.user_id IS NOT NULL) AS is_member,
+        (viewer.user_id IS NOT NULL) AS can_upload
       FROM groups g
-      LEFT JOIN group_members gm ON gm.group_id = g.id
+      LEFT JOIN group_members members ON members.group_id = g.id
+      LEFT JOIN group_members viewer
+        ON viewer.group_id = g.id
+        AND viewer.user_id::text = $2::text
       WHERE g.org_id = $1
-      GROUP BY g.id
+      GROUP BY
+        g.id,
+        viewer.role,
+        viewer.user_id
       ORDER BY g.name ASC`,
-      [orgId]
+      [orgId, String(currentUserId)]
     );
 
     res.json({ groups: result.rows });
@@ -2061,7 +2195,32 @@ app.patch('/api/agents/:id/visibility', async (req, res) => {
 
     try {
       if (visibility === "org_only") {
-        await requireOrganizationRole(client, orgId, currentUserId, ["owner", "admin"]);
+        const orgExists = await client.query(
+          `SELECT id
+          FROM organizations
+          WHERE id = $1`,
+          [orgId]
+        );
+
+        if (orgExists.rows.length === 0) {
+          const error = new Error("Organization not found.");
+          error.status = 400;
+          throw error;
+        }
+
+        const orgRole = await getOrganizationRole(client, orgId, currentUserId);
+
+        if (orgRole === "member") {
+          const error = new Error("Members can only publish agents to groups they belong to.");
+          error.status = 403;
+          throw error;
+        }
+
+        if (!["owner", "admin"].includes(orgRole)) {
+          const error = new Error("You do not have permission to publish to this organization.");
+          error.status = 403;
+          throw error;
+        }
       }
 
       if (visibility === "group_only") {
@@ -2079,8 +2238,8 @@ app.patch('/api/agents/:id/visibility', async (req, res) => {
           throw error;
         }
 
-        if (!canViewGroup(group)) {
-          const error = new Error("You do not have permission to publish into this group.");
+        if (!group.current_user_group_role) {
+          const error = new Error("You must be a member of this group to publish there.");
           error.status = 403;
           throw error;
         }
@@ -2127,6 +2286,8 @@ app.patch('/api/agents/:id/visibility', async (req, res) => {
 });
 
 app.delete('/api/agents/:id', async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const currentUserId = getCurrentUserId(req);
     const agentId = Number(req.params.id);
@@ -2135,34 +2296,47 @@ app.delete('/api/agents/:id', async (req, res) => {
       return res.status(400).json({ error: "Agent id must be a positive integer" });
     }
 
-    const result = await pool.query(
+    const agentResult = await client.query(
+      `SELECT id, user_id, deleted_at
+      FROM agents
+      WHERE id = $1`,
+      [agentId]
+    );
+
+    if (agentResult.rows.length === 0 || agentResult.rows[0].deleted_at) {
+      return res.status(404).json({ error: "Agent not found." });
+    }
+
+    if (String(agentResult.rows[0].user_id) !== String(currentUserId)) {
+      return res.status(403).json({ error: "Only the agent owner can delete this agent." });
+    }
+
+    await client.query('BEGIN');
+
+    await client.query(
+      `DELETE FROM agent_embeddings
+      WHERE agent_id = $1`,
+      [agentId]
+    );
+
+    await client.query(
       `UPDATE agents
       SET
         deleted_at = NOW(),
-        is_public = false,
-        visibility = 'private',
         updated_at = NOW()
-      WHERE id = $1
-        AND user_id = $2
-        AND deleted_at IS NULL
-      RETURNING
-        id,
-        name,
-        deleted_at`,
-      [agentId, currentUserId]
+      WHERE id = $1`,
+      [agentId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Agent not found or you do not have permission to delete it" });
-    }
+    await client.query('COMMIT');
 
-    res.json({
-      message: "Agent deleted successfully",
-      agent: result.rows[0]
-    });
+    res.json({ success: true });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error("Agent Delete Exception Stack:", error);
     res.status(500).json({ error: "Internal Server Error", details: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -2184,39 +2358,7 @@ app.get('/api/agents/:id/download', async (req, res) => {
       FROM agents a
       WHERE a.id = $1
         AND a.deleted_at IS NULL
-        AND (
-          a.visibility = 'public'
-          OR a.user_id = $2
-          OR (
-            a.visibility = 'followers'
-            AND EXISTS (
-              SELECT 1
-              FROM follows f
-              WHERE f.follower_id = $2
-                AND f.following_id = a.user_id
-            )
-          )
-          OR (
-            a.visibility = 'org_only'
-            AND a.org_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $2::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $2
-            )
-          )
-        )`,
+        AND ${visibleAgentSql("a", "$2")}`,
       [agentId, currentUserId]
     );
 
@@ -2306,39 +2448,7 @@ app.get('/api/agents/:id', async (req, res) => {
       ) rs ON rs.agent_id = a.id
       WHERE a.id = $1
         AND a.deleted_at IS NULL
-        AND (
-          a.visibility = 'public'
-          OR a.user_id = $2
-          OR (
-            a.visibility = 'followers'
-            AND EXISTS (
-              SELECT 1
-              FROM follows f
-              WHERE f.follower_id = $2
-                AND f.following_id = a.user_id
-            )
-          )
-          OR (
-            a.visibility = 'org_only'
-            AND a.org_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $2::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $2
-            )
-          )
-        )`,
+        AND ${visibleAgentSql("a", "$2")}`,
       [agentId, currentUserId]
     );
 
@@ -2388,39 +2498,7 @@ app.get("/api/agents/:id/reviews", async (req, res) => {
       FROM agents a
       WHERE a.id = $1
         AND a.deleted_at IS NULL
-        AND (
-          a.visibility = 'public'
-          OR a.user_id = $2
-          OR (
-            a.visibility = 'followers'
-            AND EXISTS (
-              SELECT 1
-              FROM follows f
-              WHERE f.follower_id = $2
-                AND f.following_id = a.user_id
-            )
-          )
-          OR (
-            a.visibility = 'org_only'
-            AND a.org_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $2::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $2
-            )
-          )
-        )
+        AND ${visibleAgentSql("a", "$2")}
       `,
       [agentId, currentUserId]
     );
@@ -2517,39 +2595,7 @@ app.post("/api/agents/:id/reviews", async (req, res) => {
       FROM agents a
       WHERE a.id = $1
         AND a.deleted_at IS NULL
-        AND (
-          a.visibility = 'public'
-          OR a.user_id = $2
-          OR (
-            a.visibility = 'followers'
-            AND EXISTS (
-              SELECT 1
-              FROM follows f
-              WHERE f.follower_id = $2
-                AND f.following_id = a.user_id
-            )
-          )
-          OR (
-            a.visibility = 'org_only'
-            AND a.org_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM organization_members om
-              WHERE om.org_id = a.org_id
-                AND om.user_id = $2::text
-            )
-          )
-          OR (
-            a.visibility = 'group_only'
-            AND a.group_id IS NOT NULL
-            AND EXISTS (
-              SELECT 1
-              FROM group_members gm
-              WHERE gm.group_id = a.group_id
-                AND gm.user_id = $2
-            )
-          )
-        )
+        AND ${visibleAgentSql("a", "$2")}
       `,
       [agentId, userId]
     );
@@ -2678,39 +2724,7 @@ app.post('/api/agents/search', async (req, res) => {
         LEFT JOIN review_stats rs ON rs.agent_id = a.id
         WHERE a.deleted_at IS NULL
           AND e.embedding IS NOT NULL
-          AND (
-            a.visibility = 'public'
-            OR a.user_id = $2
-            OR (
-              a.visibility = 'followers'
-              AND EXISTS (
-                SELECT 1
-                FROM follows f
-                WHERE f.follower_id = $2
-                  AND f.following_id = a.user_id
-              )
-            )
-            OR (
-              a.visibility = 'org_only'
-              AND a.org_id IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                FROM organization_members om
-                WHERE om.org_id = a.org_id
-                  AND om.user_id = $2::text
-              )
-            )
-            OR (
-              a.visibility = 'group_only'
-              AND a.group_id IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                FROM group_members gm
-                WHERE gm.group_id = a.group_id
-                  AND gm.user_id = $2
-              )
-            )
-          )
+          AND ${visibleAgentSql("a", "$2")}
       )
       SELECT *,
         (
